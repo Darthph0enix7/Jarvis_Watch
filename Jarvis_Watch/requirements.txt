@@ -1,0 +1,19 @@
+# Watch Client Simulator - Dependencies
+# ======================================
+
+# Core async WebSocket client
+websockets>=12.0
+
+# Audio I/O (cross-platform microphone/speaker access)
+pyaudio>=0.2.14
+
+# VAD (Voice Activity Detection) - Silero
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.24.0
+
+# Keyboard input for push-to-talk
+pynput>=1.7.6
+
+# Optional: For faster numpy operations
+# scipy>=1.11.0
