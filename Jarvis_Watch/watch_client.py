@@ -119,11 +119,16 @@ class WatchClient:
         # Send to server
         print("📤 Processing...")
         timings["send_start"] = time.time()
-        request = {
-            "type": "audio_complete",
-            "audio": [list(chunk) for chunk in audio_chunks]
-        }
-        await ws.send(json.dumps(request))
+        
+        # Send start signal
+        await ws.send(json.dumps({"type": "audio_start"}))
+        
+        # Stream audio chunks
+        for chunk in audio_chunks:
+            await ws.send(chunk)
+        
+        # Send end signal
+        await ws.send(json.dumps({"type": "audio_end"}))
         timings["send_end"] = time.time()
         
         # Receive and play response

@@ -20,18 +20,32 @@ async def handle_client(ws):
     log.info("📱 Client connected")
     
     try:
+        audio_chunks = []
+        receiving_audio = False
+        
         async for msg in ws:
-            data = json.loads(msg)
-            
-            if data.get("type") == "audio_complete":
-                await process_request(ws, data)
+            if isinstance(msg, bytes):
+                # Audio chunk
+                if receiving_audio:
+                    audio_chunks.append(msg)
+            else:
+                data = json.loads(msg)
+                msg_type = data.get("type")
+                
+                if msg_type == "audio_start":
+                    audio_chunks = []
+                    receiving_audio = True
+                elif msg_type == "audio_end":
+                    receiving_audio = False
+                    if audio_chunks:
+                        await process_request(ws, audio_chunks)
     
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
         log.info("📱 Client disconnected")
 
-async def process_request(ws, data):
+async def process_request(ws, audio_chunks: list[bytes]):
     """Process: Audio → STT → LLM → TTS → Audio."""
     timings = {
         "receive_start": time.time(),
@@ -44,12 +58,11 @@ async def process_request(ws, data):
         "complete": None
     }
     
-    audio_data = data.get("audio", [])
-    if not audio_data:
+    if not audio_chunks:
         return
     
     # Combine audio chunks
-    audio_bytes = b''.join(bytes(chunk) for chunk in audio_data)
+    audio_bytes = b''.join(audio_chunks)
     log.info(f"🎤 Received {len(audio_bytes)} bytes")
     
     # STT
