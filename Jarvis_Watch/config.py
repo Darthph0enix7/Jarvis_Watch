@@ -7,7 +7,8 @@ CARTESIA_API_KEY = os.environ.get("CARTESIA_API_KEY", "sk_car_eCzTSfNDxYxhgtewey
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCg8amdduMspsehvE5UxLdB5lRlmC3Jm64")
 
 # Voice
-VOICE_ID = "ffe42012-140d-40ab-8cc3-d3f0e957dbc9"
+VOICE_ID = "ffe42012-140d-40ab-8cc3-d3f0e957dbc9" # jarvis 
+#"228fca29-3a0a-435c-8728-5cb483251068"
 
 # Audio
 STT_SAMPLE_RATE = 16000
