@@ -1,11 +1,6 @@
 """
-Project Jarvis - Phase 1: Speech-to-Text (STT) Layer
-Using Cartesia Ink API via WebSockets
-
-This module handles:
-- Microphone selection and persistence
-- Real-time audio streaming to Cartesia STT
-- Live transcription display with proper endpointing
+Project Jarvis - Full Voice Pipeline
+STT (Cartesia) → LLM (Pluggable) → TTS (Cartesia)
 """
 
 import asyncio
@@ -16,11 +11,12 @@ import time
 import struct
 import base64
 from urllib.parse import urlencode
-from typing import AsyncIterator
 
 import pyaudio
 import websockets
-from google import genai
+
+# Import modular LLM
+from llm import GeminiLLMClient, CerebrasLLMClient, BaseLLMClient
 
 # ============================================================================
 # CONFIGURATION
@@ -37,7 +33,15 @@ TTS_SAMPLE_RATE = 24000  # Output sample rate for TTS
 
 # Gemini API configuration
 GEMINI_API_KEY = "AIzaSyCg8amdduMspsehvE5UxLdB5lRlmC3Jm64"  # Replace with your Gemini API key
-GEMINI_MODEL = "models/gemini-3-flash-preview"  # Fast model for low latency
+GEMINI_MODEL = "models/gemini-2.5-flash-lite"  # Fast model for low latency
+
+# Cerebras API configuration (ultra-fast inference)
+CEREBRAS_API_KEY = "csk-c4x6ytjrf62k4xtwx868c6fv3mwc4cdm6v695xxvc9ft5jn6"  # Get from https://cloud.cerebras.ai
+CEREBRAS_MODEL = "gpt-oss-120b"  # Options: llama-3.3-70b, llama3.1-8b
+
+# LLM Provider Selection - Change this to swap providers
+# Options: "gemini", "cerebras"
+LLM_PROVIDER = "cerebras"
 
 # Audio settings
 SAMPLE_RATE = 16000
@@ -46,12 +50,11 @@ FORMAT = pyaudio.paInt16  # 16-bit PCM
 CHUNK_SIZE = 512  # Smaller chunks for faster transcription updates (~32ms at 16kHz)
 
 # VAD (Voice Activity Detection) settings
-CALIBRATION_DURATION = 1.0  # Seconds to calibrate ambient noise
-VAD_MARGIN = 1.8  # Multiplier above ambient noise for speech detection
-SILENCE_DURATION = 1.5  # Seconds of silence before ending session
-MIN_SPEECH_DURATION = 0.5  # Minimum speech before VAD can trigger end
+CALIBRATION_DURATION = 1.0
+VAD_MARGIN = 1.8
+SILENCE_DURATION = 1.0  # Reduced from 1.5s for faster response
 
-# Cartesia API parameters
+# Cartesia STT parameters
 CARTESIA_PARAMS = {
     "api_key": CARTESIA_API_KEY,
     "cartesia_version": "2024-06-10",
@@ -60,7 +63,7 @@ CARTESIA_PARAMS = {
     "encoding": "pcm_s16le",
     "sample_rate": str(SAMPLE_RATE),
     "min_volume": "0.1",
-    "max_silence_duration_secs": "2.0",  # CRITICAL: Prevents cutting off on short pauses
+    "max_silence_duration_secs": "2.0",
 }
 
 MIC_CONFIG_FILE = "mic_config.json"
@@ -163,7 +166,7 @@ def select_microphone() -> int:
 # ============================================================================
 
 class AudioCapture:
-    """Handles microphone audio capture with asyncio compatibility."""
+    """Microphone audio capture with asyncio compatibility."""
     
     def __init__(self, device_index: int):
         self.device_index = device_index
@@ -172,198 +175,48 @@ class AudioCapture:
         self.is_running = False
     
     def start(self) -> None:
-        """Start the audio stream."""
         self.stream = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=SAMPLE_RATE,
-            input=True,
-            input_device_index=self.device_index,
+            format=FORMAT, channels=CHANNELS, rate=SAMPLE_RATE,
+            input=True, input_device_index=self.device_index,
             frames_per_buffer=CHUNK_SIZE
         )
         self.is_running = True
-        print("✓ Microphone stream started")
+        print("✓ Microphone started")
     
     def read_chunk(self) -> bytes:
-        """Read a chunk of audio data (blocking)."""
         if self.stream and self.is_running:
             return self.stream.read(CHUNK_SIZE, exception_on_overflow=False)
         return b""
     
     def stop(self) -> None:
-        """Stop the audio stream."""
         self.is_running = False
         if self.stream:
             self.stream.stop_stream()
             self.stream.close()
         self.p.terminate()
-        print("\n✓ Microphone stream stopped")
 
 
 # ============================================================================
-# GEMINI LLM CLIENT
+# LLM FACTORY
 # ============================================================================
 
-class GeminiLLMClient:
+def create_llm_client(provider: str = LLM_PROVIDER) -> BaseLLMClient:
     """
-    Handles streaming LLM inference with Gemini API.
-    Intelligently chunks streaming text for TTS pipeline.
+    Factory function to create LLM client based on provider.
+    
+    Add new providers here as they are implemented.
     """
-    
-    def __init__(self):
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
-        self.system_instruction = (
-            "You are Jarvis, an advanced AI voice assistant. "
-            "Respond naturally and concisely. Keep responses conversational and helpful. "
-            "Prioritize brevity for voice interactions."
-        )
-        
-        # Chunking configuration
-        self.chunk_buffer = ""
-        self.min_first_chunk_words = 3  # Very small first chunk for fast response
-        self.min_chunk_words = 8  # Subsequent chunks
-        self.first_chunk_sent = False
-        
-        # Punctuation for natural breaks (TTS-friendly)
-        self.strong_breaks = {'.', '!', '?', '\n'}  # End of sentence
-        self.weak_breaks = {',', ';', ':', '-', '—'}  # Clause boundaries
-        
-        # Statistics tracking
-        self.stats = {
-            'request_sent_time': None,
-            'first_token_time': None,
-            'first_chunk_time': None,
-            'response_complete_time': None,
-            'total_chunks': 0,
-            'total_response_chars': 0,
-            'total_response_words': 0,
-            'chunk_times': [],  # Time each chunk was yielded
-        }
-    
-    async def generate_streaming_response(
-        self,
-        prompt: str
-    ) -> AsyncIterator[str]:
-        """
-        Stream LLM response and yield text chunks optimized for TTS.
-        First chunk is small for low latency, subsequent chunks respect punctuation.
-        """
-        self.chunk_buffer = ""
-        self.first_chunk_sent = False
-        self.stats['chunk_times'] = []
-        
-        try:
-            # Stream response from Gemini
-            response = self.client.models.generate_content_stream(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config={
-                    'system_instruction': self.system_instruction,
-                    'temperature': 0.7,
-                    'max_output_tokens': 512,
-                    'top_p': 0.95,
-                }
-            )
-            
-            # Process streaming chunks
-            first_token_received = False
-            for chunk in response:
-                if hasattr(chunk, 'text') and chunk.text:
-                    # Track first token time
-                    if not first_token_received:
-                        self.stats['first_token_time'] = time.time()
-                        first_token_received = True
-                    
-                    self.chunk_buffer += chunk.text
-                    
-                    # Try to yield complete phrases/chunks
-                    async for output_chunk in self._process_buffer():
-                        self.stats['chunk_times'].append(time.time())
-                        if not self.stats['first_chunk_time']:
-                            self.stats['first_chunk_time'] = time.time()
-                        yield output_chunk
-            
-            # Flush any remaining text
-            if self.chunk_buffer.strip():
-                self.stats['chunk_times'].append(time.time())
-                yield self.chunk_buffer.strip()
-                self.chunk_buffer = ""
-                
-        except Exception as e:
-            print(f"\n✗ Gemini API Error: {e}")
-            yield "I apologize, but I encountered an error processing your request."
-    
-    async def _process_buffer(self) -> AsyncIterator[str]:
-        """
-        Process buffer and yield complete chunks when ready.
-        Implements smart chunking strategy:
-        - First chunk: 3+ words, break on any punctuation
-        - Later chunks: 8+ words, prefer strong breaks (. ! ?)
-        """
-        while True:
-            chunk = self._extract_chunk()
-            if chunk:
-                yield chunk
-            else:
-                break
-    
-    def _extract_chunk(self) -> str | None:
-        """
-        Extract a chunk from buffer if conditions are met.
-        Returns None if buffer should continue accumulating.
-        """
-        if not self.chunk_buffer:
-            return None
-        
-        words = self.chunk_buffer.split()
-        word_count = len(words)
-        
-        # Strategy for FIRST chunk: get something out FAST
-        if not self.first_chunk_sent:
-            if word_count >= self.min_first_chunk_words:
-                # Look for ANY break point (weak or strong)
-                for i, char in enumerate(self.chunk_buffer):
-                    if char in self.strong_breaks or char in self.weak_breaks:
-                        # Found a break! Extract up to and including it
-                        chunk = self.chunk_buffer[:i+1].strip()
-                        if len(chunk.split()) >= self.min_first_chunk_words:
-                            self.chunk_buffer = self.chunk_buffer[i+1:]
-                            self.first_chunk_sent = True
-                            return chunk
-                
-                # No punctuation yet but have enough words - force first chunk
-                if word_count >= self.min_first_chunk_words * 2:
-                    chunk = ' '.join(words[:self.min_first_chunk_words])
-                    self.chunk_buffer = ' '.join(words[self.min_first_chunk_words:])
-                    self.first_chunk_sent = True
-                    return chunk
-        
-        # Strategy for SUBSEQUENT chunks: prefer natural sentence boundaries
-        else:
-            if word_count >= self.min_chunk_words:
-                # Prefer strong breaks (end of sentence)
-                for i, char in enumerate(self.chunk_buffer):
-                    if char in self.strong_breaks:
-                        chunk = self.chunk_buffer[:i+1].strip()
-                        if len(chunk.split()) >= self.min_chunk_words:
-                            self.chunk_buffer = self.chunk_buffer[i+1:]
-                            return chunk
-                
-                # Fall back to weak breaks (commas, etc.)
-                for i, char in enumerate(self.chunk_buffer):
-                    if char in self.weak_breaks:
-                        chunk = self.chunk_buffer[:i+1].strip()
-                        if len(chunk.split()) >= self.min_chunk_words:
-                            self.chunk_buffer = self.chunk_buffer[i+1:]
-                            return chunk
-                
-                # Buffer is long but no punctuation - force a chunk
-                if word_count >= self.min_chunk_words * 2:
-                    chunk = ' '.join(words[:self.min_chunk_words])
-                    self.chunk_buffer = ' '.join(words[self.min_chunk_words:])
-                    return chunk
-        
-        return None
+    if provider == "gemini":
+        return GeminiLLMClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL)
+    elif provider == "cerebras":
+        return CerebrasLLMClient(api_key=CEREBRAS_API_KEY, model=CEREBRAS_MODEL)
+    # Add more providers here:
+    # elif provider == "openai":
+    #     return OpenAILLMClient(api_key=OPENAI_API_KEY, model=OPENAI_MODEL)
+    # elif provider == "groq":
+    #     return GroqLLMClient(api_key=GROQ_API_KEY, model=GROQ_MODEL)
+    else:
+        raise ValueError(f"Unknown LLM provider: {provider}")
 
 
 # ============================================================================
@@ -371,21 +224,15 @@ class GeminiLLMClient:
 # ============================================================================
 
 class CartesiaTTSClient:
-    """
-    Handles WebSocket connection to Cartesia TTS API.
-    Streams text chunks and receives audio in real-time.
-    """
+    """Cartesia TTS WebSocket client with real-time audio playback."""
     
     def __init__(self):
         self.ws = None
         self.is_connected = False
         self.context_id = "jarvis-response"
-        
-        # Audio playback
         self.p = pyaudio.PyAudio()
         self.audio_stream = None
         
-        # Statistics tracking
         self.stats = {
             'connection_time': None,
             'first_chunk_sent_time': None,
@@ -394,7 +241,6 @@ class CartesiaTTSClient:
             'total_chunks_sent': 0,
             'total_audio_chunks_received': 0,
             'total_audio_bytes': 0,
-            'chunk_latencies': [],  # Time from text sent to audio received
         }
     
     def build_url(self) -> str:
@@ -474,12 +320,10 @@ class CartesiaTTSClient:
                     msg_type = data.get("type", "")
                     
                     if msg_type == "chunk":
-                        # Decode and play audio
                         audio_b64 = data.get("data", "")
                         if audio_b64:
                             audio_bytes = base64.b64decode(audio_b64)
                             
-                            # Track first audio
                             if not self.stats['first_audio_received_time']:
                                 self.stats['first_audio_received_time'] = time.time()
                             
@@ -487,11 +331,9 @@ class CartesiaTTSClient:
                             self.stats['total_audio_chunks_received'] += 1
                             self.stats['total_audio_bytes'] += len(audio_bytes)
                             
-                            # Play audio immediately
                             if self.audio_stream:
                                 self.audio_stream.write(audio_bytes)
                         
-                        # Check if done
                         if data.get("done", False):
                             break
                     
@@ -499,8 +341,17 @@ class CartesiaTTSClient:
                         break
                     
                     elif msg_type == "error":
-                        print(f"\\n✗ TTS Error: {data.get('message', 'Unknown')}")
+                        print(f"\n✗ TTS Error: {data.get('message', 'Unknown')}")
                         break
+            
+            # Wait for audio buffer to finish playing
+            # Calculate remaining audio duration based on bytes in buffer
+            if self.stats['total_audio_bytes'] > 0:
+                total_duration = self.stats['total_audio_bytes'] / (TTS_SAMPLE_RATE * 2)  # 2 bytes per sample
+                elapsed = time.time() - self.stats['first_audio_received_time'] if self.stats['first_audio_received_time'] else 0
+                remaining = max(0, total_duration - elapsed + 0.1)  # Add small buffer
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
                         
         except websockets.exceptions.ConnectionClosed:
             self.is_connected = False
@@ -521,10 +372,7 @@ class CartesiaTTSClient:
 # ============================================================================
 
 class CartesiaSTTClient:
-    """
-    Handles WebSocket connection to Cartesia STT API.
-    Manages audio streaming and transcription reception.
-    """
+    """Cartesia STT WebSocket client with VAD."""
     
     def __init__(self):
         self.ws = None
@@ -559,25 +407,12 @@ class CartesiaSTTClient:
         return f"{CARTESIA_STT_URL}?{query_string}"
     
     async def connect(self) -> None:
-        """Establish WebSocket connection to Cartesia."""
         url = self.build_url()
-        print(f"\n🔌 Connecting to Cartesia STT...")
-        
         try:
-            self.ws = await websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=5
-            )
+            self.ws = await websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5)
             self.is_connected = True
             self.stats['connection_established_time'] = time.time()
-            print("✓ Connected to Cartesia STT")
-            print("✓ Voice Activity Detection enabled (2 sec silence timeout)")
-            print("\n" + "=" * 60)
-            print("🎤 SPEAK NOW... (Will auto-stop after 2 seconds of silence)")
-            print("   Press Ctrl+C to interrupt")
-            print("=" * 60 + "\n")
+            print("\\n🎤 SPEAK NOW... (auto-stops after silence)\\n")
         except Exception as e:
             print(f"✗ Failed to connect: {e}")
             raise
@@ -736,7 +571,7 @@ class CartesiaSTTClient:
 
 def display_combined_statistics(
     stt_client: CartesiaSTTClient,
-    llm_client: GeminiLLMClient,
+    llm_client: BaseLLMClient,
     tts_client: CartesiaTTSClient = None
 ) -> None:
     """Display comprehensive statistics for STT + LLM + TTS pipeline."""
@@ -745,7 +580,7 @@ def display_combined_statistics(
     tts_stats = tts_client.stats if tts_client else {}
     
     print("\n" + "=" * 60)
-    print("📊 SESSION STATISTICS")
+    print(f"📊 SESSION STATISTICS (LLM: {llm_client.provider_name})")
     print("=" * 60)
     
     # ==================== STT TIMING ====================
@@ -895,54 +730,35 @@ def display_combined_statistics(
 # ASYNC TASKS
 # ============================================================================
 
-async def calibration_task(
-    audio: AudioCapture,
-    client: CartesiaSTTClient
-) -> None:
-    """
-    Task: Brief calibration to measure ambient noise level.
-    """
-    print("🔧 Calibrating... (measuring ambient noise for 1 second)")
+async def calibration_task(audio: AudioCapture, client: CartesiaSTTClient) -> None:
+    """Brief calibration to measure ambient noise."""
+    print("🔧 Calibrating...")
     loop = asyncio.get_event_loop()
-    
     rms_values = []
-    start_time = time.time()
+    start = time.time()
     
-    while (time.time() - start_time) < CALIBRATION_DURATION:
+    while (time.time() - start) < CALIBRATION_DURATION:
         chunk = await loop.run_in_executor(None, audio.read_chunk)
         if chunk:
-            rms = client.calculate_rms(chunk)
-            rms_values.append(rms)
-        await asyncio.sleep(0.01)  # Small delay
+            rms_values.append(client.calculate_rms(chunk))
+        await asyncio.sleep(0.01)
     
-    # Calculate baseline (average ambient noise)
     if rms_values:
-        avg_ambient = sum(rms_values) / len(rms_values)
-        # Set threshold with margin above ambient
-        client.silence_threshold = max(avg_ambient * VAD_MARGIN, 200)  # Minimum 200
-        client.is_calibrated = True
-        print(f"✓ Calibration complete (Ambient: {avg_ambient:.0f}, Threshold: {client.silence_threshold:.0f})")
+        avg = sum(rms_values) / len(rms_values)
+        client.silence_threshold = max(avg * VAD_MARGIN, 200)
     else:
-        # Fallback if no data
         client.silence_threshold = 300
-        client.is_calibrated = True
-        print("✓ Calibration complete (using default threshold)")
+    
+    client.is_calibrated = True
+    print(f"✓ Calibrated (threshold: {client.silence_threshold:.0f})")
 
 
-async def audio_capture_task(
-    audio: AudioCapture,
-    audio_queue: asyncio.Queue,
-    stop_event: asyncio.Event
-) -> None:
-    """
-    Task: Continuously capture audio and put chunks in queue.
-    Runs in executor to avoid blocking the event loop.
-    """
+async def audio_capture_task(audio: AudioCapture, audio_queue: asyncio.Queue, stop_event: asyncio.Event) -> None:
+    """Capture audio chunks and queue them."""
     loop = asyncio.get_event_loop()
     
     while not stop_event.is_set():
         try:
-            # Run blocking read in executor
             chunk = await loop.run_in_executor(None, audio.read_chunk)
             if chunk:
                 await audio_queue.put(chunk)
@@ -950,37 +766,26 @@ async def audio_capture_task(
             print(f"\n✗ Audio capture error: {e}")
             break
     
-    # Signal end of audio
     await audio_queue.put(None)
 
 
-async def audio_sender_task(
-    client: CartesiaSTTClient,
-    audio_queue: asyncio.Queue,
-    stop_event: asyncio.Event
-) -> None:
-    """
-    Task: Send audio chunks from queue to Cartesia.
-    Monitors VAD and triggers finalize on silence detection.
-    """
+async def audio_sender_task(client: CartesiaSTTClient, audio_queue: asyncio.Queue, stop_event: asyncio.Event) -> None:
+    """Send audio to Cartesia, monitor VAD for end of speech."""
     while not stop_event.is_set() and client.is_connected and not client.session_done:
         try:
             chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
             if chunk is None:
                 break
             
-            # Check voice activity
             client.check_voice_activity(chunk)
-            
-            # Send audio to API
             await client.send_audio(chunk)
             
             # If VAD detected end of speech, finalize
             if client.vad_triggered and not client.session_done:
-                print("\n\n🔇 Silence detected - finalizing transcription...")
+                print("\n\n🔇 Silence detected - finalizing...")
                 client.stats['finalize_sent_time'] = time.time()
                 await client.send_finalize()
-                await asyncio.sleep(0.5)  # Wait for final transcripts
+                # Don't wait - let message_receiver get final transcript
                 client.session_done = True
                 client.display_done()
                 await client.send_done()
@@ -996,16 +801,9 @@ async def audio_sender_task(
             break
 
 
-async def message_receiver_task(
-    client: CartesiaSTTClient,
-    stop_event: asyncio.Event
-) -> None:
-    """
-    Task: Receive and process messages from Cartesia.
-    Stops when session completes (2 seconds of silence detected).
-    """
+async def message_receiver_task(client: CartesiaSTTClient, stop_event: asyncio.Event) -> None:
+    """Receive transcription messages from Cartesia."""
     await client.receive_messages()
-    # Session ended - signal all other tasks to stop
     stop_event.set()
 
 
@@ -1018,15 +816,10 @@ async def llm_to_tts_pipeline(
     tts_client: CartesiaTTSClient,
     transcript: str
 ) -> None:
-    """
-    Run LLM generation and TTS conversion in parallel.
-    Chunks are sent to TTS as soon as they're generated.
-    """
+    """Run LLM and TTS in parallel - chunks sent to TTS immediately."""
     tts_queue: asyncio.Queue = asyncio.Queue()
-    llm_done = asyncio.Event()
     
     async def llm_producer():
-        """Generate LLM response and queue chunks for TTS."""
         chunk_num = 0
         full_response = ""
         
@@ -1034,51 +827,37 @@ async def llm_to_tts_pipeline(
             async for chunk in llm_client.generate_streaming_response(transcript):
                 chunk_num += 1
                 full_response += chunk + " "
-                print(f"[LLM → TTS] Chunk {chunk_num}: {chunk}")
-                await tts_queue.put((chunk, False))  # (text, is_last)
+                print(f"[{chunk_num}] {chunk}")
+                await tts_queue.put((chunk, False))
             
-            # Signal last chunk
-            await tts_queue.put((None, True))
+            await tts_queue.put((None, True))  # Signal done
             
             llm_client.stats['response_complete_time'] = time.time()
             llm_client.stats['total_chunks'] = chunk_num
             llm_client.stats['total_response_chars'] = len(full_response.strip())
             llm_client.stats['total_response_words'] = len(full_response.strip().split())
-            
         except Exception as e:
             print(f"\n✗ LLM error: {e}")
             await tts_queue.put((None, True))
-        finally:
-            llm_done.set()
     
     async def tts_consumer():
-        """Consume chunks from queue and send to TTS."""
         while True:
             text, is_last = await tts_queue.get()
-            
             if text is None:
                 break
-            
             await tts_client.send_text_chunk(text, is_last=is_last)
     
     async def tts_receiver():
-        """Receive and play audio from TTS."""
         await tts_client.receive_and_play_audio()
     
-    # Run all three tasks in parallel
-    await asyncio.gather(
-        llm_producer(),
-        tts_consumer(),
-        tts_receiver()
-    )
+    await asyncio.gather(llm_producer(), tts_consumer(), tts_receiver())
 
 
 async def main() -> None:
-    """Main entry point for Jarvis STT + LLM + TTS pipeline."""
-    print("\n" + "=" * 60)
-    print("  PROJECT JARVIS - Full Voice Pipeline")
-    print("  STT: Cartesia Ink | LLM: Gemini | TTS: Cartesia")
-    print("=" * 60)
+    """Main entry point - full voice pipeline."""
+    print("\n" + "=" * 50)
+    print("  JARVIS - Voice Assistant")
+    print("=" * 50)
     
     # Step 1: Microphone setup
     device_index = select_microphone()
@@ -1086,8 +865,10 @@ async def main() -> None:
     # Initialize components
     audio = AudioCapture(device_index)
     stt_client = CartesiaSTTClient()
-    llm_client = GeminiLLMClient()
+    llm_client = create_llm_client(LLM_PROVIDER)  # Use factory
     tts_client = CartesiaTTSClient()
+    
+    print(f"✓ LLM Provider: {llm_client.provider_name}")
     
     audio_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
     stop_event = asyncio.Event()
@@ -1103,41 +884,37 @@ async def main() -> None:
         # Step 4: Connect to Cartesia STT
         await stt_client.connect()
         
-        # Step 5: Run STT pipeline
+        # Pre-connect TTS in background to save latency later
+        tts_connect_task = asyncio.create_task(tts_client.connect())
+        
+        # Run STT pipeline
         await asyncio.gather(
             audio_capture_task(audio, audio_queue, stop_event),
             audio_sender_task(stt_client, audio_queue, stop_event),
             message_receiver_task(stt_client, stop_event)
         )
         
-        # STT cleanup
+        # Cleanup STT
         stop_event.set()
         if audio.is_running:
             audio.stop()
         
-        # Step 6: Process through LLM + TTS pipeline
+        # Ensure TTS is connected
+        await tts_connect_task
+        
+        # Process through LLM + TTS pipeline
         if stt_client.full_transcript.strip():
             transcript = stt_client.full_transcript.strip()
             
             print("\n" + "=" * 60)
             print(f"🧠 Processing: {transcript}")
-            print("=" * 60)
-            print("\n🔊 JARVIS SPEAKING:\n")
+            print("=" * 60 + "\n")
             
-            # Connect to TTS
-            await tts_client.connect()
-            
-            # Track LLM timing
             llm_client.stats['request_sent_time'] = time.time()
             
             try:
-                # Run LLM → TTS pipeline in parallel
                 await llm_to_tts_pipeline(llm_client, tts_client, transcript)
-                
-                print("\n" + "=" * 60)
-                print("✅ Response complete")
-                print("=" * 60)
-                
+                print("\n✅ Response complete\n")
             except Exception as e:
                 print(f"\n✗ Pipeline error: {e}")
                 import traceback
@@ -1146,21 +923,17 @@ async def main() -> None:
                 await tts_client.close()
         else:
             print("\n⚠ No transcript to process")
+            await tts_client.close()
         
     except KeyboardInterrupt:
-        print("\n\n⚠ Interrupted by user")
+        print("\n\n⚠ Interrupted")
         if stt_client.full_transcript.strip():
-            print("\n" + "=" * 60)
-            print("PARTIAL TRANSCRIPTION")
-            print("=" * 60)
-            print(f"\n{stt_client.full_transcript.strip()}\n")
-            print("=" * 60)
+            print(f"\nPartial: {stt_client.full_transcript.strip()}\n")
     except Exception as e:
         print(f"\n✗ Error: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        # Final cleanup
         if audio.is_running:
             audio.stop()
         
