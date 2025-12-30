@@ -345,13 +345,14 @@ class CartesiaTTSClient:
                         break
             
             # Wait for audio buffer to finish playing
-            # Calculate remaining audio duration based on bytes in buffer
-            if self.stats['total_audio_bytes'] > 0:
-                total_duration = self.stats['total_audio_bytes'] / (TTS_SAMPLE_RATE * 2)  # 2 bytes per sample
-                elapsed = time.time() - self.stats['first_audio_received_time'] if self.stats['first_audio_received_time'] else 0
-                remaining = max(0, total_duration - elapsed + 0.1)  # Add small buffer
-                if remaining > 0:
-                    await asyncio.sleep(remaining)
+            # Audio arrives faster than real-time, so we must wait for full playback
+            if self.stats['total_audio_bytes'] > 0 and self.stats['first_audio_received_time']:
+                total_audio_duration = self.stats['total_audio_bytes'] / (TTS_SAMPLE_RATE * 2)  # 2 bytes per sample
+                # Calculate when playback should end (from when we started + full duration)
+                playback_end_time = self.stats['first_audio_received_time'] + total_audio_duration
+                wait_time = playback_end_time - time.time() + 0.3  # 300ms safety buffer
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
                         
         except websockets.exceptions.ConnectionClosed:
             self.is_connected = False
