@@ -35,6 +35,7 @@ from datetime import datetime
 import websockets
 from websockets.server import WebSocketServerProtocol
 from websockets.http import Headers
+from websockets.asyncio.server import Response
 
 # Import LLM providers
 from llm import GeminiLLMClient, CerebrasLLMClient, BaseLLMClient
@@ -50,12 +51,12 @@ from protocol import (
 # ============================================================================
 
 # Authentication
-AUTH_TOKEN = os.environ.get("JARVIS_AUTH_TOKEN", "jarvis_secret_2024")
+AUTH_TOKEN = os.environ.get("JARVIS_AUTH_TOKEN", "Denemeler123.")
 
 # API Keys (load from environment or use defaults for development)
-CARTESIA_API_KEY = os.environ.get("CARTESIA_API_KEY", "sk_car_DAwyAsQnVVDUhqJm6mfBir")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCg8amdduMspsehvE5UxLdB5lRlmC3Jm64")
-CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "csk-c4x6ytjrf62k4xtwx868c6fv3mwc4cdm6v695xxvc9ft5jn6")
+CARTESIA_API_KEY = os.environ.get("CARTESIA_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY")
 
 # Statistics storage
 STATS_FILE = "session_stats.jsonl"  # JSON Lines format for easy appending
@@ -909,11 +910,12 @@ class JarvisServer:
         except Exception:
             return False
     
-    async def process_request(self, path: str, request_headers: Headers):
+    async def process_request(self, connection, request):
         """Process WebSocket handshake - validate authentication."""
+        path = request.path  # Extract path from request object
         if not self.validate_token(path):
             print(f"[Server] Authentication failed for path: {path}")
-            return (401, [("Content-Type", "text/plain")], b"Unauthorized: Invalid or missing token")
+            return Response(401, "Unauthorized", b"Unauthorized: Invalid or missing token")
         return None  # Allow connection
     
     async def handle_client(self, websocket: WebSocketServerProtocol) -> None:

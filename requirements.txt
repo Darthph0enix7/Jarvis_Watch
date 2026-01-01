@@ -1,0 +1,12 @@
+# Jarvis Voice Assistant - Python Dependencies
+# ================================================
+
+# Core WebSocket support
+websockets
+
+# Audio processing (for main.py and demo_client.py)
+# PyAudio
+
+# LLM Providers
+google-genai
+cerebras-cloud-sdk
