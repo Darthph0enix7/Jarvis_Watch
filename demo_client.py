@@ -41,14 +41,19 @@ from protocol import (
 # CONFIGURATION
 # ============================================================================
 
-DEFAULT_SERVER_URL = "ws://localhost:8080"
-DEFAULT_AUTH_TOKEN = "jarvis_secret_2024"
+DEFAULT_SERVER_URL = "ws://158.180.35.23:8000"
+DEFAULT_AUTH_TOKEN = "Denemeler123."
 
 # Audio settings
 SAMPLE_RATE = INPUT_SAMPLE_RATE  # 16kHz for input
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
 CHUNK_SIZE = 512  # ~32ms chunks
+
+# Voice Activity Detection settings
+SILENCE_THRESHOLD = 500  # Energy threshold for silence
+SILENCE_DURATION = 1.0  # Seconds of silence before auto-stop
+MIN_SPEECH_DURATION = 0.5  # Minimum seconds of speech before allowing stop
 
 # Mic config file (reuse from main.py)
 MIC_CONFIG_FILE = "mic_config.json"
@@ -142,13 +147,18 @@ def select_microphone() -> int:
 # ============================================================================
 
 class AudioCapture:
-    """Microphone audio capture."""
+    """Microphone audio capture with voice activity detection."""
     
     def __init__(self, device_index: int):
         self.device_index = device_index
         self.p = pyaudio.PyAudio()
         self.stream = None
         self.is_running = False
+        
+        # VAD state
+        self.silence_start = None
+        self.speech_start = None
+        self.has_speech = False
     
     def start(self) -> None:
         self.stream = self.p.open(
@@ -160,11 +170,63 @@ class AudioCapture:
             frames_per_buffer=CHUNK_SIZE
         )
         self.is_running = True
+        self.silence_start = None
+        self.speech_start = None
+        self.has_speech = False
     
     def read_chunk(self) -> bytes:
         if self.stream and self.is_running:
             return self.stream.read(CHUNK_SIZE, exception_on_overflow=False)
         return b""
+    
+    def get_audio_energy(self, audio_bytes: bytes) -> float:
+        """Calculate RMS energy of audio chunk."""
+        if len(audio_bytes) < 2:
+            return 0.0
+        
+        # Convert bytes to int16 samples
+        samples = struct.unpack(f"{len(audio_bytes)//2}h", audio_bytes)
+        
+        # Calculate RMS
+        sum_squares = sum(s * s for s in samples)
+        rms = (sum_squares / len(samples)) ** 0.5
+        return rms
+    
+    def is_silence(self, audio_bytes: bytes) -> bool:
+        """Check if audio chunk is silence."""
+        energy = self.get_audio_energy(audio_bytes)
+        return energy < SILENCE_THRESHOLD
+    
+    def update_vad(self, audio_bytes: bytes) -> bool:
+        """
+        Update voice activity detection state.
+        Returns True if speech should stop (silence detected).
+        """
+        current_time = time.time()
+        is_silent = self.is_silence(audio_bytes)
+        
+        if not is_silent:
+            # Speech detected
+            self.silence_start = None
+            if not self.has_speech:
+                self.speech_start = current_time
+                self.has_speech = True
+        else:
+            # Silence detected
+            if self.has_speech and self.silence_start is None:
+                self.silence_start = current_time
+        
+        # Check if we should stop
+        if self.has_speech and self.silence_start:
+            speech_duration = self.silence_start - self.speech_start
+            silence_duration = current_time - self.silence_start
+            
+            # Stop if enough speech and enough silence
+            if (speech_duration >= MIN_SPEECH_DURATION and 
+                silence_duration >= SILENCE_DURATION):
+                return True
+        
+        return False
     
     def stop(self) -> None:
         self.is_running = False
@@ -231,11 +293,11 @@ class AudioPlayer:
 
 
 # ============================================================================
-# KEYBOARD INPUT HANDLER
+# SIMPLE INPUT HANDLER
 # ============================================================================
 
-class KeyboardHandler:
-    """Non-blocking keyboard input handler using select for macOS compatibility."""
+class SimpleInputHandler:
+    """Simple input handler for quit command."""
     
     def __init__(self):
         self.input_queue = asyncio.Queue()
@@ -244,44 +306,35 @@ class KeyboardHandler:
         self._loop = None
     
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Start keyboard listener thread."""
+        """Start input listener thread."""
         self._loop = loop
         self.thread = threading.Thread(target=self._listen, daemon=True)
         self.thread.start()
     
     def _listen(self) -> None:
-        """Listen for keyboard input in background thread."""
-        import select
-        
+        """Listen for input in background thread."""
         while self.running:
             try:
-                # Use select to check if input is available (works on macOS/Linux)
-                if select.select([sys.stdin], [], [], 0.1)[0]:
-                    line = sys.stdin.readline().strip()
-                    if self._loop and self._loop.is_running():
-                        self._loop.call_soon_threadsafe(
-                            self.input_queue.put_nowait, line
-                        )
+                line = input()
+                if self._loop and self._loop.is_running():
+                    self._loop.call_soon_threadsafe(
+                        self.input_queue.put_nowait, line.strip()
+                    )
+            except (EOFError, KeyboardInterrupt):
+                break
             except Exception:
                 break
     
     def stop(self) -> None:
         self.running = False
     
-    async def wait_for_input(self) -> str:
-        """Wait for keyboard input."""
-        return await self.input_queue.get()
-    
-    def has_input(self) -> bool:
-        """Check if input is available."""
-        return not self.input_queue.empty()
-    
-    async def get_input_nowait(self) -> Optional[str]:
-        """Get input without waiting, return None if none available."""
+    async def check_quit(self) -> bool:
+        """Check if user wants to quit."""
         try:
-            return self.input_queue.get_nowait()
+            line = self.input_queue.get_nowait()
+            return line.lower() in ['q', 'quit', 'exit']
         except asyncio.QueueEmpty:
-            return None
+            return False
 
 
 # ============================================================================
@@ -309,7 +362,7 @@ class DemoClient:
         
         self.audio_capture = AudioCapture(device_index)
         self.audio_player = AudioPlayer()
-        self.keyboard = KeyboardHandler()
+        self.input_handler = SimpleInputHandler()
         
         # State
         self.current_transcript = ""
@@ -511,23 +564,27 @@ class DemoClient:
         print("-" * 40)
     
     async def recording_loop(self) -> None:
-        """Main recording loop - captures and sends audio."""
+        """Main recording loop - captures and sends audio with silence detection."""
         self.audio_capture.start()
         self.is_recording = True
         
         loop = asyncio.get_event_loop()
         
+        print("🎤 Listening... (speak now, will auto-stop on silence)")
+        
         while self.is_recording and self.session_active:
             try:
-                # Check for stop signal (ENTER pressed)
-                if self.keyboard.has_input():
-                    await self.keyboard.get_input_nowait()
-                    break
-                
                 # Capture audio chunk
                 chunk = await loop.run_in_executor(None, self.audio_capture.read_chunk)
                 if chunk:
+                    # Send audio to server
                     await self.send_audio(chunk)
+                    
+                    # Check for silence
+                    should_stop = self.audio_capture.update_vad(chunk)
+                    if should_stop:
+                        print("\n✓ Silence detected, stopping...")
+                        break
                 
                 await asyncio.sleep(0.001)  # Small yield
                 
@@ -540,7 +597,7 @@ class DemoClient:
         
         # Signal end of speech
         if self.session_active:
-            print("\n\n🔇 Processing...")
+            print("🔇 Processing...")
             self.is_processing = True
             await self.end_speech()
     
@@ -596,47 +653,53 @@ class DemoClient:
             pass
     
     async def run(self) -> None:
-        """Main client loop."""
+        """Main client loop with automatic sessions."""
         print("\n" + "=" * 60)
-        print("  JARVIS DEMO CLIENT")
+        print("  JARVIS DEMO CLIENT - AUTO MODE")
         print("=" * 60)
         print(f"\n  Server: {self.server_url}")
         print(f"  Token: {self.auth_token[:4]}...{self.auth_token[-4:]}")
-        print("\n  Controls:")
-        print("    - Press ENTER to start recording")
-        print("    - Press ENTER again to stop (or wait for auto-stop)")
-        print("    - Type 'q' + ENTER to quit")
+        print(f"\n  Voice Detection:")
+        print(f"    - Silence threshold: {SILENCE_THRESHOLD}")
+        print(f"    - Auto-stop after {SILENCE_DURATION}s of silence")
+        print(f"\n  Controls:")
+        print(f"    - Type 'q' or 'quit' + ENTER to exit")
         print("\n" + "=" * 60)
         
         # Connect to server
         if not await self.connect():
             return
         
-        # Start keyboard handler
+        # Start input handler
         loop = asyncio.get_running_loop()
-        self.keyboard.start(loop)
+        self.input_handler.start(loop)
         
-        print("\n>>> Press ENTER to start voice session <<<\n")
+        print("\n⏳ Starting voice session in 2 seconds...")
+        print("   (Type 'q' + ENTER anytime to quit)\n")
+        
+        await asyncio.sleep(2)
         
         try:
+            session_count = 0
             while True:
-                # Wait for user input
-                user_input = await self.keyboard.wait_for_input()
-                
-                if user_input.lower() == 'q':
-                    print("\nGoodbye!")
+                # Check for quit command
+                if await self.input_handler.check_quit():
+                    print("\n👋 Goodbye!")
                     break
                 
                 # Reconnect if needed
                 if not self.is_connected:
+                    print("\n⚠ Reconnecting...")
                     if not await self.connect():
-                        print("Failed to reconnect. Press ENTER to try again.")
+                        print("✗ Failed to reconnect. Waiting 5s...")
+                        await asyncio.sleep(5)
                         continue
                 
                 # Start voice session
-                print("\n" + "-" * 40)
-                print("🎙️  Starting voice session...")
-                print("-" * 40)
+                session_count += 1
+                print("\n" + "=" * 60)
+                print(f"🎙️  SESSION #{session_count}")
+                print("=" * 60)
                 
                 # Reinitialize audio components for new session
                 self.audio_capture = AudioCapture(self.device_index)
@@ -644,12 +707,20 @@ class DemoClient:
                 
                 await self.voice_session()
                 
-                print("\n>>> Press ENTER for new session, 'q' to quit <<<\n")
+                print("\n⏳ Starting next session in 3 seconds...")
+                print("   (Type 'q' + ENTER to quit)\n")
+                
+                # Wait before next session
+                for i in range(30):  # 3 seconds in 0.1s increments
+                    if await self.input_handler.check_quit():
+                        print("\n👋 Goodbye!")
+                        return
+                    await asyncio.sleep(0.1)
         
         except KeyboardInterrupt:
-            print("\n\nInterrupted")
+            print("\n\n👋 Interrupted - Goodbye!")
         finally:
-            self.keyboard.stop()
+            self.input_handler.stop()
             await self.disconnect()
             self.audio_capture.terminate()
             self.audio_player.terminate()
