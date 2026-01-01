@@ -10,7 +10,7 @@ Usage:
     python server.py [--host HOST] [--port PORT] [--llm PROVIDER] [--token TOKEN]
 
 Example:
-    python server.py --host 0.0.0.0 --port 8080 --llm cerebras --token mysecret
+    python server.py --host 0.0.0.0 --port 8000 --llm cerebras    #--token mysecret
 
 Environment Variables:
     JARVIS_AUTH_TOKEN - Authentication token for clients
@@ -68,6 +68,9 @@ CARTESIA_TTS_URL = "wss://api.cartesia.ai/tts/websocket"
 # TTS configuration
 TTS_VOICE_ID = "ffe42012-140d-40ab-8cc3-d3f0e957dbc9"
 TTS_MODEL = "sonic-3-2025-10-27"
+TTS_SPEED = 1.2  # Range: 0.6 to 1.5 (multiplier on default speed)
+TTS_VOLUME = 1.5  # Range: 0.5 to 2.0 (multiplier on default volume)
+TTS_EMOTION = "neutral"  # Options: neutral, angry, excited, content, sad, scared, etc.
 
 # LLM configuration
 GEMINI_MODEL = "models/gemini-2.5-flash-lite"
@@ -541,6 +544,11 @@ class CartesiaTTSClient:
             "language": "en",
             "context_id": self.context_id,
             "continue": not is_last,
+            "generation_config": {
+                "speed": TTS_SPEED,
+                "volume": TTS_VOLUME,
+                "emotion": TTS_EMOTION
+            }
         }
         
         try:
