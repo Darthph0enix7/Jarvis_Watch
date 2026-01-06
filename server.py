@@ -10,7 +10,7 @@ Usage:
     python server.py [--host HOST] [--port PORT] [--llm PROVIDER] [--token TOKEN]
 
 Example:
-    python server.py --host 0.0.0.0 --port 8000 --llm cerebras    #--token mysecret
+    python server.py --reload --host 0.0.0.0 --port 8000 --llm cerebras    #--token mysecret
 
 Environment Variables:
     JARVIS_AUTH_TOKEN - Authentication token for clients
@@ -27,15 +27,21 @@ import argparse
 import uuid
 import hashlib
 import secrets
+import signal
+import subprocess
 from typing import Optional
 from urllib.parse import urlencode, parse_qs, urlparse
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
+from pathlib import Path
 
 import websockets
 from websockets.server import WebSocketServerProtocol
 from websockets.http import Headers
 from websockets.asyncio.server import Response
+from aiohttp import web
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 # Import LLM providers
 from llm import GeminiLLMClient, CerebrasLLMClient, BaseLLMClient
@@ -60,6 +66,9 @@ CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY")
 
 # Statistics storage
 STATS_FILE = "session_stats.jsonl"  # JSON Lines format for easy appending
+
+# Firebase configuration
+FIREBASE_SERVICE_ACCOUNT = "jarvis-app-43084-firebase-adminsdk-fbsvc-c836619551.json"
 
 # Cartesia endpoints
 CARTESIA_STT_URL = "wss://api.cartesia.ai/stt/websocket"
@@ -91,6 +100,409 @@ CARTESIA_PARAMS = {
     "min_volume": "0.1",
     "max_silence_duration_secs": "2.0",
 }
+
+
+# ============================================================================
+# FIREBASE & DEVICE MANAGEMENT
+# ============================================================================
+
+@dataclass
+class LocationRecord:
+    """Record of a device location update."""
+    device_id: str
+    device_type: str
+    latitude: float
+    longitude: float
+    accuracy: float
+    altitude: Optional[float] = None
+    speed: Optional[float] = None
+    bearing: Optional[float] = None
+    provider: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+    received_at: float = field(default_factory=time.time)
+    
+    def to_dict(self) -> dict:
+        return {
+            'device_id': self.device_id,
+            'device_type': self.device_type,
+            'latitude': self.latitude,
+            'longitude': self.longitude,
+            'accuracy': self.accuracy,
+            'altitude': self.altitude,
+            'speed': self.speed,
+            'bearing': self.bearing,
+            'provider': self.provider,
+            'timestamp': self.timestamp,
+            'received_at': self.received_at,
+            'datetime': datetime.fromtimestamp(self.timestamp).isoformat()
+        }
+
+
+class LocationTracker:
+    """Tracks device locations and saves them to file."""
+    
+    def __init__(self, filepath: str = "device_locations.jsonl"):
+        self.filepath = filepath
+        self.locations: dict[str, LocationRecord] = {}  # device_id -> latest location
+        self.location_history: list[LocationRecord] = []  # All locations
+    
+    def update_location(self, location: LocationRecord) -> None:
+        """Update device location and save to file."""
+        self.locations[location.device_id] = location
+        self.location_history.append(location)
+        self.save_location(location)
+    
+    def save_location(self, location: LocationRecord) -> None:
+        """Append location to JSON Lines file."""
+        with open(self.filepath, 'a') as f:
+            f.write(json.dumps(location.to_dict()) + '\n')
+    
+    def get_latest_location(self, device_id: str) -> Optional[LocationRecord]:
+        """Get latest location for a device."""
+        return self.locations.get(device_id)
+    
+    def get_all_latest(self) -> dict[str, LocationRecord]:
+        """Get latest locations for all devices."""
+        return self.locations.copy()
+
+
+class PeriodicLocationTracker:
+    """Periodically requests location from all devices."""
+    
+    def __init__(self, fcm_service: 'FCMNotificationService', 
+                 device_manager: 'DeviceManager',
+                 location_tracker: LocationTracker,
+                 interval_minutes: int = 30):
+        self.fcm_service = fcm_service
+        self.device_manager = device_manager
+        self.location_tracker = location_tracker
+        self.interval_minutes = interval_minutes
+        self.is_running = False
+        self.task: Optional[asyncio.Task] = None
+    
+    async def start(self) -> None:
+        """Start periodic location tracking."""
+        if self.is_running:
+            return
+        
+        self.is_running = True
+        self.task = asyncio.create_task(self._run_periodic_task())
+        print(f"[LocationTracker] Started periodic tracking (every {self.interval_minutes} minutes)")
+    
+    async def stop(self) -> None:
+        """Stop periodic location tracking."""
+        self.is_running = False
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        print("[LocationTracker] Stopped periodic tracking")
+    
+    async def _run_periodic_task(self) -> None:
+        """Main periodic task loop."""
+        while self.is_running:
+            try:
+                await self.request_all_locations()
+                # Wait for interval
+                await asyncio.sleep(self.interval_minutes * 60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[LocationTracker] Error in periodic task: {e}")
+                await asyncio.sleep(60)  # Wait 1 minute before retry on error
+    
+    async def request_all_locations(self) -> None:
+        """Request location from all active devices."""
+        device_ids = list(self.device_manager.devices.keys())
+        active_devices = [did for did in device_ids 
+                         if self.device_manager.devices[did]['is_active']]
+        
+        if not active_devices:
+            total_devices = len(self.device_manager.devices)
+            if total_devices == 0:
+                print("[LocationTracker] ⚠️  No devices registered yet")
+                print("[LocationTracker]    Devices must POST to /api/register-device first")
+                print("[LocationTracker]    Check Android app FCM initialization logs\n")
+            else:
+                print(f"[LocationTracker] ⚠️  {total_devices} devices registered but all inactive")
+                for did, info in self.device_manager.devices.items():
+                    print(f"[LocationTracker]    - {did}: is_active={info['is_active']}\n")
+            return
+        
+        print(f"\n[LocationTracker] Requesting location from {len(active_devices)} devices...")
+        
+        for device_id in active_devices:
+            try:
+                device_info = self.device_manager.devices[device_id]
+                device_type = device_info['device_type']
+                
+                # Check if device recently responded (online status)
+                last_seen_str = device_info.get('last_seen')
+                if last_seen_str:
+                    last_seen = datetime.fromisoformat(last_seen_str)
+                    time_since_seen = (datetime.now() - last_seen).total_seconds()
+                    
+                    # If not seen in 5 minutes, consider offline
+                    if time_since_seen > 300:
+                        status = "⚠️  OFFLINE"
+                    else:
+                        status = "✅ ONLINE"
+                else:
+                    status = "❓ UNKNOWN"
+                
+                print(f"  {status} {device_id} ({device_type}) - Requesting location...")
+                
+                result = await self.fcm_service.request_location(device_id, priority="normal")
+                
+                if result.get('status') == 'sent':
+                    print(f"    ✓ Request sent: {result.get('message_id', 'N/A')}")
+                else:
+                    print(f"    ✗ Failed: {result.get('error', 'Unknown error')}")
+                
+            except Exception as e:
+                print(f"    ✗ Error for {device_id}: {e}")
+        
+        print(f"[LocationTracker] Location requests sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+
+class DeviceManager:
+    """Manages FCM device registration and messaging."""
+    
+    def __init__(self):
+        self.devices = {}  # device_id -> device_info
+        self.token_to_device = {}  # fcm_token -> device_id
+        self.pending_requests = {}  # request_id -> request_info
+        
+        # Initialize Firebase Admin SDK
+        try:
+            cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
+            firebase_admin.initialize_app(cred)
+            print("[FCM] Firebase Admin SDK initialized successfully")
+        except Exception as e:
+            print(f"[FCM] Firebase initialization failed: {e}")
+            raise
+    
+    def register_device(self, device_data: dict) -> dict:
+        """Register a device with its FCM token."""
+        device_id = device_data.get('device_id')
+        fcm_token = device_data.get('fcm_token')
+        device_type = device_data.get('device_type', 'unknown')
+        
+        if not device_id or not fcm_token:
+            raise ValueError("device_id and fcm_token are required")
+        
+        # Store device info
+        self.devices[device_id] = {
+            'fcm_token': fcm_token,
+            'device_type': device_type,
+            'app_version': device_data.get('app_version', 'unknown'),
+            'os_version': device_data.get('os_version', 'unknown'),
+            'registered_at': device_data.get('timestamp', datetime.now().isoformat()),
+            'last_seen': datetime.now().isoformat(),
+            'is_active': True
+        }
+        
+        # Reverse lookup
+        self.token_to_device[fcm_token] = device_id
+        
+        print(f"[FCM] Device registered: {device_id} ({device_type})")
+        
+        return {
+            'status': 'success',
+            'device_id': device_id,
+            'registered_at': self.devices[device_id]['registered_at']
+        }
+    
+    def get_device(self, device_id: str) -> Optional[dict]:
+        """Get device info by ID."""
+        return self.devices.get(device_id)
+    
+    def get_token(self, device_id: str) -> Optional[str]:
+        """Get FCM token for a device."""
+        device = self.devices.get(device_id)
+        return device['fcm_token'] if device else None
+    
+    def get_devices_by_type(self, device_type: str) -> list:
+        """Get all devices of a specific type."""
+        return [
+            device_id for device_id, info in self.devices.items()
+            if info['device_type'] == device_type and info['is_active']
+        ]
+    
+    def get_all_tokens(self) -> list:
+        """Get all active FCM tokens."""
+        return [
+            info['fcm_token'] for info in self.devices.values()
+            if info['is_active']
+        ]
+    
+    def get_tokens_by_type(self, device_type: str) -> list:
+        """Get FCM tokens for devices of a specific type."""
+        return [
+            info['fcm_token'] for device_id, info in self.devices.items()
+            if info['device_type'] == device_type and info['is_active']
+        ]
+    
+    def update_last_seen(self, device_id: str) -> None:
+        """Update device's last seen timestamp."""
+        if device_id in self.devices:
+            self.devices[device_id]['last_seen'] = datetime.now().isoformat()
+    
+    def deactivate_device(self, device_id: str) -> bool:
+        """Mark device as inactive."""
+        if device_id in self.devices:
+            self.devices[device_id]['is_active'] = False
+            return True
+        return False
+    
+    def get_stats(self) -> dict:
+        """Get device statistics."""
+        total = len(self.devices)
+        active = sum(1 for d in self.devices.values() if d['is_active'])
+        phones = sum(1 for d in self.devices.values() if d['device_type'] == 'phone' and d['is_active'])
+        watches = sum(1 for d in self.devices.values() if d['device_type'] == 'watch' and d['is_active'])
+        
+        return {
+            'total_devices': total,
+            'active_devices': active,
+            'phones': phones,
+            'watches': watches
+        }
+
+
+class FCMNotificationService:
+    """Service for sending FCM push notifications."""
+    
+    def __init__(self, device_manager: DeviceManager):
+        self.device_manager = device_manager
+    
+    async def send_to_device(self, device_id: str, title: str, body: str, data: dict = None) -> dict:
+        """Send notification to a specific device."""
+        token = self.device_manager.get_token(device_id)
+        if not token:
+            raise ValueError(f"Device not found: {device_id}")
+        
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            data=data or {},
+            token=token,
+        )
+        
+        try:
+            response = messaging.send(message)
+            print(f"[FCM] Sent to {device_id}: {response}")
+            return {'status': 'sent', 'message_id': response, 'device_id': device_id}
+        except Exception as e:
+            print(f"[FCM] Failed to send to {device_id}: {e}")
+            return {'status': 'failed', 'error': str(e), 'device_id': device_id}
+    
+    async def send_to_multiple(self, device_ids: list, title: str, body: str, data: dict = None) -> dict:
+        """Send notification to multiple devices."""
+        tokens = [self.device_manager.get_token(did) for did in device_ids]
+        tokens = [t for t in tokens if t]  # Filter None values
+        
+        if not tokens:
+            return {'status': 'failed', 'error': 'No valid tokens found'}
+        
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            data=data or {},
+            tokens=tokens,
+        )
+        
+        try:
+            response = messaging.send_multicast(message)
+            print(f"[FCM] Multicast: {response.success_count} sent, {response.failure_count} failed")
+            return {
+                'status': 'sent',
+                'success_count': response.success_count,
+                'failure_count': response.failure_count
+            }
+        except Exception as e:
+            print(f"[FCM] Multicast failed: {e}")
+            return {'status': 'failed', 'error': str(e)}
+    
+    async def send_to_type(self, device_type: str, title: str, body: str, data: dict = None) -> dict:
+        """Send notification to all devices of a type (phone/watch)."""
+        device_ids = self.device_manager.get_devices_by_type(device_type)
+        return await self.send_to_multiple(device_ids, title, body, data)
+    
+    async def broadcast_to_all(self, title: str, body: str, data: dict = None) -> dict:
+        """Send notification to all registered devices."""
+        device_ids = list(self.device_manager.devices.keys())
+        return await self.send_to_multiple(device_ids, title, body, data)
+    
+    async def request_location(self, device_id: str, priority: str = "high") -> dict:
+        """Request GPS location from a device."""
+        request_id = f"loc_{device_id}_{int(time.time())}"
+        return await self.send_to_device(
+            device_id,
+            "Location Request",
+            "Server requesting your location",
+            {
+                "action": "get_location",
+                "priority": priority,
+                "accuracy": "high",
+                "request_id": request_id
+            }
+        )
+    
+    async def request_location_from_all(self, priority: str = "normal") -> dict:
+        """Request location from all devices."""
+        device_ids = list(self.device_manager.devices.keys())
+        request_id = f"loc_all_{int(time.time())}"
+        return await self.send_to_multiple(
+            device_ids,
+            "Location Request",
+            "Server requesting location from all devices",
+            {
+                "action": "get_location",
+                "priority": priority,
+                "request_id": request_id
+            }
+        )
+    
+    async def execute_command(self, device_id: str, command: str) -> dict:
+        """Execute a command on a device."""
+        request_id = f"cmd_{device_id}_{int(time.time())}"
+        return await self.send_to_device(
+            device_id,
+            "Command Execution",
+            f"Executing: {command}",
+            {
+                "action": "execute_command",
+                "command": command,
+                "request_id": request_id
+            }
+        )
+    
+    async def send_silent_data(self, device_id: str, data: dict) -> dict:
+        """Send data-only message without notification."""
+        token = self.device_manager.get_token(device_id)
+        if not token:
+            raise ValueError(f"Device not found: {device_id}")
+        
+        message = messaging.Message(
+            data=data,
+            token=token,
+            android=messaging.AndroidConfig(
+                priority='high',
+            )
+        )
+        
+        try:
+            response = messaging.send(message)
+            return {'status': 'sent', 'message_id': response, 'device_id': device_id}
+        except Exception as e:
+            return {'status': 'failed', 'error': str(e), 'device_id': device_id}
 
 
 # ============================================================================
@@ -614,8 +1026,8 @@ class CartesiaTTSClient:
 class VoiceSession:
     """Handles a single voice session with a client."""
     
-    def __init__(self, client_ws: WebSocketServerProtocol, llm_provider: str = "cerebras"):
-        self.client_ws = client_ws
+    def __init__(self, client_ws, llm_provider: str = "cerebras"):
+        self.client_ws = client_ws  # Can be WebSocketServerProtocol or aiohttp WebSocketResponse
         self.session_id = str(uuid.uuid4())[:8]
         self.llm_provider = llm_provider
         
@@ -642,16 +1054,24 @@ class VoiceSession:
     async def send_to_client(self, message: dict) -> None:
         """Send JSON message to client."""
         try:
-            await self.client_ws.send(json.dumps(message))
-        except websockets.exceptions.ConnectionClosed:
+            # Support both websockets and aiohttp WebSocket
+            if hasattr(self.client_ws, 'send_json'):
+                await self.client_ws.send_json(message)
+            else:
+                await self.client_ws.send(json.dumps(message))
+        except (websockets.exceptions.ConnectionClosed, ConnectionResetError, RuntimeError):
             self.is_active = False
     
     async def send_audio_to_client(self, audio_bytes: bytes, is_final: bool = False) -> None:
         """Send audio chunk to client."""
         # Send as raw binary for efficiency
         try:
-            await self.client_ws.send(audio_bytes)
-        except websockets.exceptions.ConnectionClosed:
+            # Support both websockets and aiohttp WebSocket
+            if hasattr(self.client_ws, 'send_bytes'):
+                await self.client_ws.send_bytes(audio_bytes)
+            else:
+                await self.client_ws.send(audio_bytes)
+        except (websockets.exceptions.ConnectionClosed, ConnectionResetError, RuntimeError):
             self.is_active = False
     
     async def on_transcript_update(self, text: str, is_final: bool) -> None:
@@ -891,102 +1311,129 @@ class VoiceSession:
 
 
 # ============================================================================
-# WEBSOCKET SERVER
+# HTTP REST API (for device registration & FCM)
 # ============================================================================
 
-class JarvisServer:
-    """WebSocket server for Jarvis voice assistant."""
+class HTTPAPIServer:
+    """Unified HTTP/WebSocket server for device management, FCM, and voice assistant."""
     
-    def __init__(self, host: str = "0.0.0.0", port: int = 8080, 
-                 llm_provider: str = "cerebras", auth_token: str = None):
-        self.host = host
-        self.port = port
+    def __init__(self, device_manager: DeviceManager, fcm_service: FCMNotificationService, 
+                 llm_provider: str, auth_token: str, location_tracker: LocationTracker):
+        self.device_manager = device_manager
+        self.fcm_service = fcm_service
         self.llm_provider = llm_provider
-        self.auth_token = auth_token or AUTH_TOKEN
+        self.auth_token = auth_token
+        self.location_tracker = location_tracker
+        self.app = web.Application()
         self.active_sessions: dict[str, VoiceSession] = {}
+        self.setup_routes()
     
-    def validate_token(self, path: str) -> bool:
-        """Validate authentication token from URL query string."""
-        try:
-            # Parse query parameters from path
-            if '?' in path:
-                query_string = path.split('?', 1)[1]
-                params = parse_qs(query_string)
-                token = params.get('token', [None])[0]
-                return token == self.auth_token
-            return False
-        except Exception:
-            return False
+    def setup_routes(self):
+        """Setup HTTP and WebSocket routes."""
+        # WebSocket endpoint for voice assistant
+        self.app.router.add_get('/ws', self.websocket_handler)
+        
+        # HTTP API endpoints for FCM and device management
+        self.app.router.add_post('/api/register-device', self.register_device)
+        self.app.router.add_post('/api/request-location/{device_id}', self.request_location)
+        self.app.router.add_post('/api/request-location-all', self.request_location_all)
+        self.app.router.add_post('/api/execute-command/{device_id}', self.execute_command)
+        self.app.router.add_post('/api/send-to-type/{device_type}', self.send_to_type)
+        self.app.router.add_post('/api/send-notification/{device_id}', self.send_notification)
+        self.app.router.add_post('/api/broadcast', self.broadcast)
+        self.app.router.add_post('/api/location-update', self.location_update)
+        self.app.router.add_post('/api/device-response', self.device_response)
+        self.app.router.add_get('/api/devices', self.list_devices)
+        self.app.router.add_get('/api/devices/{device_id}', self.get_device_info)
+        self.app.router.add_get('/api/stats', self.get_stats)
+        self.app.router.add_get('/api/debug/devices', self.debug_devices)  # Debug endpoint
+        self.app.router.add_delete('/api/devices/{device_id}', self.deactivate_device)
     
-    async def process_request(self, connection, request):
-        """Process WebSocket handshake - validate authentication."""
-        path = request.path  # Extract path from request object
-        if not self.validate_token(path):
-            print(f"[Server] Authentication failed for path: {path}")
-            return Response(401, "Unauthorized", b"Unauthorized: Invalid or missing token")
-        return None  # Allow connection
+    def validate_token(self, request: web.Request) -> bool:
+        """Validate authentication token from query parameter."""
+        token = request.query.get('token')
+        return token == self.auth_token
     
-    async def handle_client(self, websocket: WebSocketServerProtocol) -> None:
-        """Handle a single client connection."""
-        client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-        print(f"[Server] New authenticated connection from {client_id}")
+    async def websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
+        """Handle WebSocket connections for voice assistant."""
+        
+        # Prepare WebSocket FIRST (complete handshake)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        # THEN validate authentication
+        if not self.validate_token(request):
+            # Send error message via WebSocket and close gracefully
+            await ws.send_json({
+                "type": "error",
+                "message": "Unauthorized: Invalid or missing token"
+            })
+            await ws.close(code=4401, message=b'Unauthorized')
+            print(f"[Server] Rejected connection: invalid token from {request.remote}")
+            return ws
+        
+        client_id = f"{request.remote}:{request.transport.get_extra_info('peername')[1] if request.transport else 'unknown'}"
+        print(f"[Server] New authenticated WebSocket connection from {client_id}")
         
         session: Optional[VoiceSession] = None
         
         try:
-            async for message in websocket:
-                # Handle binary audio data
-                if isinstance(message, bytes):
+            async for msg in ws:
+                if msg.type == web.WSMsgType.BINARY:
+                    # Handle binary audio data
                     if session and session.is_active:
-                        await session.receive_audio(message)
-                    continue
+                        await session.receive_audio(msg.data)
                 
-                # Handle JSON messages
-                try:
-                    data = parse_message(message)
-                    msg_type = data.get("type", "")
+                elif msg.type == web.WSMsgType.TEXT:
+                    # Handle JSON messages
+                    try:
+                        data = json.loads(msg.data)
+                        msg_type = data.get("type", "")
+                        
+                        if msg_type == MessageType.SESSION_START.value:
+                            # Start new session
+                            if session:
+                                await session.cancel()
+                            
+                            # Create session with aiohttp WebSocket wrapper
+                            session = VoiceSession(ws, self.llm_provider)
+                            self.active_sessions[session.session_id] = session
+                            
+                            # Get client type from message
+                            client_type = data.get("client_type", "unknown")
+                            
+                            # Run session in background
+                            asyncio.create_task(session.start(client_type=client_type))
+                        
+                        elif msg_type == MessageType.AUDIO.value:
+                            # Base64 encoded audio
+                            if session and session.is_active:
+                                audio_bytes = base64.b64decode(data.get("data", ""))
+                                await session.receive_audio(audio_bytes)
+                        
+                        elif msg_type == MessageType.END_OF_SPEECH.value:
+                            if session:
+                                await session.end_of_speech()
+                        
+                        elif msg_type == MessageType.CANCEL.value:
+                            if session:
+                                await session.cancel()
+                                session = None
+                        
+                        elif msg_type == MessageType.PING.value:
+                            await ws.send_json({"type": MessageType.PONG.value})
                     
-                    if msg_type == MessageType.SESSION_START.value:
-                        # Start new session
-                        if session:
-                            await session.cancel()
-                        
-                        session = VoiceSession(websocket, self.llm_provider)
-                        self.active_sessions[session.session_id] = session
-                        
-                        # Get client type from message
-                        client_type = data.get("client_type", "unknown")
-                        
-                        # Run session in background
-                        asyncio.create_task(session.start(client_type=client_type))
-                    
-                    elif msg_type == MessageType.AUDIO.value:
-                        # Base64 encoded audio
+                    except json.JSONDecodeError:
+                        # Might be raw binary that looks like string
                         if session and session.is_active:
-                            audio_bytes = base64.b64decode(data.get("data", ""))
-                            await session.receive_audio(audio_bytes)
-                    
-                    elif msg_type == MessageType.END_OF_SPEECH.value:
-                        if session:
-                            await session.end_of_speech()
-                    
-                    elif msg_type == MessageType.CANCEL.value:
-                        if session:
-                            await session.cancel()
-                            session = None
-                    
-                    elif msg_type == MessageType.PING.value:
-                        await websocket.send(json.dumps({"type": MessageType.PONG.value}))
-                    
-                except json.JSONDecodeError:
-                    # Might be raw binary that looks like string
-                    if session and session.is_active:
-                        await session.receive_audio(message.encode() if isinstance(message, str) else message)
+                            await session.receive_audio(msg.data.encode() if isinstance(msg.data, str) else msg.data)
+                
+                elif msg.type == web.WSMsgType.ERROR:
+                    print(f'[Server] WebSocket error: {ws.exception()}')
+                    break
         
-        except websockets.exceptions.ConnectionClosed:
-            print(f"[Server] Connection closed: {client_id}")
         except Exception as e:
-            print(f"[Server] Error handling client {client_id}: {e}")
+            print(f"[Server] Error handling WebSocket client {client_id}: {e}")
             import traceback
             traceback.print_exc()
         finally:
@@ -994,10 +1441,366 @@ class JarvisServer:
                 await session.cancel()
                 if session.session_id in self.active_sessions:
                     del self.active_sessions[session.session_id]
-            print(f"[Server] Client disconnected: {client_id}")
+            print(f"[Server] WebSocket client disconnected: {client_id}")
+        
+        return ws
+    
+    async def register_device(self, request: web.Request) -> web.Response:
+        """Register a new device."""
+        try:
+            data = await request.json()
+            print(f"\n[Registration] Received device registration:")
+            print(f"  Device ID: {data.get('device_id')}")
+            print(f"  Device Type: {data.get('device_type')}")
+            print(f"  FCM Token: {data.get('fcm_token', 'N/A')[:20]}...")
+            print(f"  Full data: {json.dumps(data, indent=2)}\n")
+            
+            result = self.device_manager.register_device(data)
+            
+            print(f"[Registration] ✓ Device registered successfully: {data.get('device_id')}")
+            print(f"[Registration] Total devices now: {len(self.device_manager.devices)}\n")
+            
+            return web.json_response(result)
+        except ValueError as e:
+            print(f"[Registration] ✗ Registration failed: {e}\n")
+            return web.json_response({'error': str(e)}, status=400)
+        except Exception as e:
+            print(f"[Registration] ✗ Internal error: {e}")
+            import traceback
+            traceback.print_exc()
+            return web.json_response({'error': f'Internal error: {str(e)}'}, status=500)
+    
+    async def request_location(self, request: web.Request) -> web.Response:
+        """Request location from a specific device."""
+        device_id = request.match_info['device_id']
+        priority = request.query.get('priority', 'high')
+        
+        try:
+            result = await self.fcm_service.request_location(device_id, priority)
+            return web.json_response(result)
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=404)
+        except Exception as e:
+            return web.json_response({'error': f'Internal error: {str(e)}'}, status=500)
+    
+    async def request_location_all(self, request: web.Request) -> web.Response:
+        """Request location from all devices."""
+        priority = request.query.get('priority', 'normal')
+        result = await self.fcm_service.request_location_from_all(priority)
+        return web.json_response(result)
+    
+    async def execute_command(self, request: web.Request) -> web.Response:
+        """Execute a command on a specific device."""
+        device_id = request.match_info['device_id']
+        
+        try:
+            data = await request.json()
+            command = data.get('command')
+            
+            if not command:
+                return web.json_response({'error': 'command is required'}, status=400)
+            
+            result = await self.fcm_service.execute_command(device_id, command)
+            return web.json_response(result)
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=404)
+        except Exception as e:
+            return web.json_response({'error': f'Internal error: {str(e)}'}, status=500)
+    
+    async def send_to_type(self, request: web.Request) -> web.Response:
+        """Send notification to all devices of a type."""
+        device_type = request.match_info['device_type']
+        
+        try:
+            data = await request.json()
+            title = data.get('title', 'JARVIS')
+            body = data.get('body', 'Message from server')
+            notification_data = data.get('data', {})
+            
+            result = await self.fcm_service.send_to_type(device_type, title, body, notification_data)
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response({'error': f'Internal error: {str(e)}'}, status=500)
+    
+    async def send_notification(self, request: web.Request) -> web.Response:
+        """Send notification to a specific device."""
+        device_id = request.match_info['device_id']
+        
+        try:
+            data = await request.json()
+            title = data.get('title', 'JARVIS')
+            body = data.get('body', 'Message from server')
+            notification_data = data.get('data', {})
+            
+            result = await self.fcm_service.send_to_device(device_id, title, body, notification_data)
+            return web.json_response(result)
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=404)
+        except Exception as e:
+            return web.json_response({'error': f'Internal error: {str(e)}'}, status=500)
+    
+    async def broadcast(self, request: web.Request) -> web.Response:
+        """Broadcast notification to all devices."""
+        try:
+            data = await request.json()
+            title = data.get('title', 'JARVIS Broadcast')
+            body = data.get('body', 'Message from server')
+            notification_data = data.get('data', {})
+            
+            result = await self.fcm_service.broadcast_to_all(title, body, notification_data)
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response({'error': f'Internal error: {str(e)}'}, status=500)
+    
+    async def location_update(self, request: web.Request) -> web.Response:
+        """Receive location update from device."""
+        try:
+            data = await request.json()
+            device_id = data.get('device_id')
+            latitude = data.get('latitude')
+            longitude = data.get('longitude')
+            
+            print(f"[Location] {device_id}: {latitude}, {longitude}")
+            print(f"[Location] Full data: {json.dumps(data, indent=2)}")
+            
+            # Update last seen
+            self.device_manager.update_last_seen(device_id)
+            
+            # Here you could store location in database, trigger geofencing, etc.
+            
+            return web.json_response({'status': 'received', 'device_id': device_id})
+        except Exception as e:
+            return web.json_response({'error': f'Internal error: {str(e)}'}, status=500)
+    
+    async def device_response(self, request: web.Request) -> web.Response:
+        """Receive response from device after action execution."""
+        try:
+            data = await request.json()
+            
+            device_id = data.get('device_id')
+            device_type = data.get('device_type', 'unknown')
+            action = data.get('action')
+            status = data.get('status')
+            request_id = data.get('request_id')
+            timestamp = data.get('timestamp', time.time() * 1000) / 1000  # Convert ms to seconds
+            
+            print(f"\n[DeviceResponse] {device_id} ({device_type}) - {action}: {status}")
+            
+            # Update last seen (device is online)
+            self.device_manager.update_last_seen(device_id)
+            
+            # Handle based on action type
+            if action == 'get_location':
+                if status == 'success':
+                    location_data = data.get('data', {})
+                    lat = location_data.get('latitude')
+                    lon = location_data.get('longitude')
+                    accuracy = location_data.get('accuracy', 0)
+                    altitude = location_data.get('altitude')
+                    speed = location_data.get('speed')
+                    bearing = location_data.get('bearing')
+                    provider = location_data.get('provider', 'unknown')
+                    
+                    print(f"  📍 Location: {lat:.6f}, {lon:.6f}")
+                    print(f"  📊 Accuracy: ±{accuracy:.1f}m | Provider: {provider}")
+                    if altitude is not None:
+                        print(f"  🏔️  Altitude: {altitude:.1f}m")
+                    if speed is not None and speed > 0:
+                        print(f"  🚗 Speed: {speed:.1f} m/s ({speed * 3.6:.1f} km/h)")
+                    if bearing is not None:
+                        print(f"  🧭 Bearing: {bearing:.1f}°")
+                    
+                    # Create location record
+                    location = LocationRecord(
+                        device_id=device_id,
+                        device_type=device_type,
+                        latitude=lat,
+                        longitude=lon,
+                        accuracy=accuracy,
+                        altitude=altitude,
+                        speed=speed,
+                        bearing=bearing,
+                        provider=provider,
+                        timestamp=timestamp
+                    )
+                    
+                    # Save to tracker
+                    self.location_tracker.update_location(location)
+                    print(f"  ✓ Location saved to {self.location_tracker.filepath}")
+                    
+                else:
+                    error = data.get('error', 'Unknown error')
+                    exception = data.get('exception')
+                    print(f"  ✗ Location failed: {error}")
+                    if exception:
+                        print(f"    Exception: {exception}")
+            
+            elif action == 'execute_command':
+                if status == 'success':
+                    command_data = data.get('data', {})
+                    command = command_data.get('command')
+                    result = command_data.get('result')
+                    
+                    print(f"  ✓ Command '{command}' executed: {result}")
+                else:
+                    error = data.get('error', 'Unknown error')
+                    print(f"  ✗ Command failed: {error}")
+            
+            # Store request response for tracking
+            if request_id:
+                self.device_manager.pending_requests[request_id] = {
+                    'response': data,
+                    'received_at': time.time()
+                }
+            
+            # Log full response for debugging
+            print(f"  📋 Full response: {json.dumps(data, indent=2)}\n")
+            
+            return web.json_response({'status': 'acknowledged'})
+            
+        except Exception as e:
+            print(f"[DeviceResponse] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return web.json_response({'error': f'Internal error: {str(e)}'}, status=500)
+    
+    async def list_devices(self, request: web.Request) -> web.Response:
+        """List all registered devices."""
+        devices = {
+            device_id: {
+                'device_type': info['device_type'],
+                'app_version': info['app_version'],
+                'os_version': info['os_version'],
+                'registered_at': info['registered_at'],
+                'last_seen': info['last_seen'],
+                'is_active': info['is_active']
+            }
+            for device_id, info in self.device_manager.devices.items()
+        }
+        return web.json_response({'devices': devices})
+    
+    async def get_device_info(self, request: web.Request) -> web.Response:
+        """Get info for a specific device."""
+        device_id = request.match_info['device_id']
+        device = self.device_manager.get_device(device_id)
+        
+        if not device:
+            return web.json_response({'error': 'Device not found'}, status=404)
+        
+        # Don't expose FCM token in response
+        safe_device = {k: v for k, v in device.items() if k != 'fcm_token'}
+        return web.json_response({'device_id': device_id, **safe_device})
+    
+    async def get_stats(self, request: web.Request) -> web.Response:
+        """Get device statistics."""
+        stats = self.device_manager.get_stats()
+        return web.json_response(stats)
+    
+    async def deactivate_device(self, request: web.Request) -> web.Response:
+        """Deactivate a device."""
+        device_id = request.match_info['device_id']
+        success = self.device_manager.deactivate_device(device_id)
+        
+        if not success:
+            return web.json_response({'error': 'Device not found'}, status=404)
+        
+        return web.json_response({'status': 'deactivated', 'device_id': device_id})
+    
+    async def debug_devices(self, request: web.Request) -> web.Response:
+        """Debug endpoint to check device registration status."""
+        if not self.device_manager:
+            return web.json_response({
+                'error': 'FCM disabled',
+                'device_manager': None
+            })
+        
+        devices_info = {
+            'total_devices': len(self.device_manager.devices),
+            'devices': {}
+        }
+        
+        for device_id, info in self.device_manager.devices.items():
+            last_seen_str = info.get('last_seen')
+            if last_seen_str:
+                last_seen = datetime.fromisoformat(last_seen_str)
+                time_since = (datetime.now() - last_seen).total_seconds()
+                status = "ONLINE" if time_since < 300 else "OFFLINE"
+            else:
+                status = "UNKNOWN"
+            
+            devices_info['devices'][device_id] = {
+                'device_type': info['device_type'],
+                'is_active': info['is_active'],
+                'status': status,
+                'last_seen': last_seen_str,
+                'registered_at': info['registered_at'],
+                'app_version': info.get('app_version', 'unknown'),
+                'has_fcm_token': bool(info.get('fcm_token'))
+            }
+        
+        return web.json_response(devices_info)
+
+
+# ============================================================================
+# UNIFIED SERVER
+# ============================================================================
+
+class JarvisServer:
+    """Unified HTTP/WebSocket server for Jarvis voice assistant and device management."""
+    
+    def __init__(self, host: str = "0.0.0.0", port: int = 8000,
+                 llm_provider: str = "cerebras", auth_token: str = None,
+                 enable_fcm: bool = True, location_interval: int = 30):
+        self.host = host
+        self.port = port
+        self.llm_provider = llm_provider
+        self.auth_token = auth_token or AUTH_TOKEN
+        self.enable_fcm = enable_fcm
+        self.location_interval = location_interval
+        
+        # FCM components
+        self.device_manager: Optional[DeviceManager] = None
+        self.fcm_service: Optional[FCMNotificationService] = None
+        self.location_tracker: Optional[LocationTracker] = None
+        self.periodic_tracker: Optional[PeriodicLocationTracker] = None
+        self.http_api: Optional[HTTPAPIServer] = None
+        
+        if enable_fcm:
+            try:
+                self.device_manager = DeviceManager()
+                self.fcm_service = FCMNotificationService(self.device_manager)
+                self.location_tracker = LocationTracker()
+                self.periodic_tracker = PeriodicLocationTracker(
+                    self.fcm_service,
+                    self.device_manager,
+                    self.location_tracker,
+                    interval_minutes=location_interval
+                )
+                self.http_api = HTTPAPIServer(
+                    self.device_manager, 
+                    self.fcm_service,
+                    self.llm_provider,
+                    self.auth_token,
+                    self.location_tracker
+                )
+                print("[Server] FCM services initialized")
+            except Exception as e:
+                print(f"[Server] FCM initialization failed: {e}")
+                print("[Server] Continuing without FCM support")
+                self.enable_fcm = False
+        else:
+            # Create HTTP API without FCM
+            self.location_tracker = LocationTracker()
+            self.http_api = HTTPAPIServer(
+                None, 
+                None,
+                self.llm_provider,
+                self.auth_token,
+                self.location_tracker
+            )
     
     async def start(self) -> None:
-        """Start the WebSocket server."""
+        """Start the unified HTTP/WebSocket server."""
         print("\n" + "=" * 60)
         print("  JARVIS VOICE ASSISTANT SERVER")
         print("=" * 60)
@@ -1005,20 +1808,164 @@ class JarvisServer:
         print(f"  Port: {self.port}")
         print(f"  LLM Provider: {self.llm_provider}")
         print(f"  Auth Token: {self.auth_token[:4]}...{self.auth_token[-4:]}")
-        print(f"\n  WebSocket URL: ws://{self.host}:{self.port}?token=<your_token>")
+        print(f"\n  WebSocket URL: ws://{self.host}:{self.port}/ws?token=<your_token>")
+        print(f"  HTTP API URL: http://{self.host}:{self.port}/api")
         print(f"\n  Stats File: {STATS_FILE}")
+        if self.enable_fcm:
+            print(f"\n  FCM: Enabled")
+            print(f"    - Device Registration: POST /api/register-device")
+            print(f"    - Request Location: POST /api/request-location/{{device_id}}")
+            print(f"    - Execute Command: POST /api/execute-command/{{device_id}}")
+            print(f"    - List Devices: GET /api/devices")
+            print(f"\n  Location Tracking: Every {self.location_interval} minutes")
+            print(f"    - Location File: device_locations.jsonl")
         print("\n" + "=" * 60)
         print("\nWaiting for connections...\n")
         
-        async with websockets.serve(
-            self.handle_client,
-            self.host,
-            self.port,
-            ping_interval=30,
-            ping_timeout=10,
-            process_request=self.process_request,
-        ):
-            await asyncio.Future()  # Run forever
+        # Start unified server
+        runner = web.AppRunner(self.http_api.app)
+        await runner.setup()
+        site = web.TCPSite(runner, self.host, self.port)
+        await site.start()
+        
+        print(f"[Server] Server started on {self.host}:{self.port}")
+        print(f"[Server] WebSocket endpoint: /ws")
+        print(f"[Server] HTTP API endpoints: /api/*")
+        
+        # Start periodic location tracking
+        if self.enable_fcm and self.periodic_tracker:
+            await self.periodic_tracker.start()
+        
+        print()
+        
+        # Run forever
+        try:
+            await asyncio.Future()
+        finally:
+            # Cleanup on shutdown
+            if self.periodic_tracker:
+                await self.periodic_tracker.stop()
+
+
+# ============================================================================
+# AUTO-RELOAD FUNCTIONALITY
+# ============================================================================
+
+class ServerReloader:
+    """Monitors files for changes and restarts the server."""
+    
+    def __init__(self, watch_dirs=None, watch_extensions=None):
+        self.watch_dirs = watch_dirs or [Path.cwd()]
+        self.watch_extensions = watch_extensions or {'.py'}
+        self.file_mtimes = {}
+        self.process = None
+        self.should_exit = False
+        
+        # Scan initial file modification times
+        self._scan_files()
+    
+    def _scan_files(self):
+        """Scan all monitored files and store their modification times."""
+        for watch_dir in self.watch_dirs:
+            for ext in self.watch_extensions:
+                for filepath in Path(watch_dir).rglob(f'*{ext}'):
+                    try:
+                        self.file_mtimes[filepath] = filepath.stat().st_mtime
+                    except OSError:
+                        pass
+    
+    def check_for_changes(self) -> bool:
+        """Check if any monitored files have changed."""
+        changed_files = []
+        
+        # Check existing files for modifications
+        for filepath, old_mtime in list(self.file_mtimes.items()):
+            try:
+                new_mtime = filepath.stat().st_mtime
+                if new_mtime != old_mtime:
+                    changed_files.append(filepath)
+                    self.file_mtimes[filepath] = new_mtime
+            except OSError:
+                # File was deleted
+                changed_files.append(filepath)
+                del self.file_mtimes[filepath]
+        
+        # Check for new files
+        for watch_dir in self.watch_dirs:
+            for ext in self.watch_extensions:
+                for filepath in Path(watch_dir).rglob(f'*{ext}'):
+                    if filepath not in self.file_mtimes:
+                        try:
+                            self.file_mtimes[filepath] = filepath.stat().st_mtime
+                            changed_files.append(filepath)
+                        except OSError:
+                            pass
+        
+        if changed_files:
+            print(f"\n[Reloader] Detected changes in:")
+            for f in changed_files:
+                print(f"  - {f.name}")
+            return True
+        return False
+    
+    def start_server(self, args):
+        """Start the server as a subprocess."""
+        cmd = [sys.executable] + sys.argv
+        # Remove --reload flag to avoid infinite recursion
+        cmd = [arg for arg in cmd if arg != '--reload']
+        
+        print(f"\n[Reloader] Starting server...")
+        self.process = subprocess.Popen(cmd)
+        return self.process
+    
+    def stop_server(self):
+        """Stop the server subprocess."""
+        if self.process:
+            print(f"\n[Reloader] Stopping server...")
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            self.process = None
+    
+    def run(self, args):
+        """Main reload loop."""
+        print("\n" + "=" * 60)
+        print("  🔄 AUTO-RELOAD MODE ENABLED")
+        print("=" * 60)
+        print(f"\n  Monitoring: {', '.join(str(d) for d in self.watch_dirs)}")
+        print(f"  Extensions: {', '.join(self.watch_extensions)}")
+        print(f"  Files tracked: {len(self.file_mtimes)}")
+        print("\n  Press Ctrl+C to stop")
+        print("=" * 60)
+        
+        def signal_handler(signum, frame):
+            self.should_exit = True
+            self.stop_server()
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Start initial server
+        self.start_server(args)
+        
+        try:
+            while not self.should_exit:
+                time.sleep(1)  # Check every second
+                
+                if self.check_for_changes():
+                    self.stop_server()
+                    print("[Reloader] Restarting server...\n")
+                    time.sleep(0.5)  # Brief pause before restart
+                    self.start_server(args)
+        
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop_server()
 
 
 # ============================================================================
@@ -1028,19 +1975,36 @@ class JarvisServer:
 def main():
     parser = argparse.ArgumentParser(description="Jarvis Voice Assistant Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8080, help="Port to bind to (default: 8080)")
+    parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
     parser.add_argument("--llm", default="cerebras", choices=["gemini", "cerebras"],
                         help="LLM provider (default: cerebras)")
     parser.add_argument("--token", default=None, 
-                        help="Authentication token (default: from JARVIS_AUTH_TOKEN env or 'jarvis_secret_2024')")
+                        help="Authentication token (default: from JARVIS_AUTH_TOKEN env or 'Denemeler123.')")
+    parser.add_argument("--no-fcm", action="store_true",
+                        help="Disable FCM functionality")
+    parser.add_argument("--location-interval", type=int, default=1,
+                        help="Location tracking interval in minutes (default: 30)")
+    parser.add_argument("--reload", action="store_true",
+                        help="Enable auto-reload on file changes")
     
     args = parser.parse_args()
     
+    # If reload mode, start the reloader instead
+    if args.reload:
+        reloader = ServerReloader(
+            watch_dirs=[Path.cwd()],
+            watch_extensions={'.py', '.json'}
+        )
+        reloader.run(args)
+        return
+    
     server = JarvisServer(
         host=args.host, 
-        port=args.port, 
+        port=args.port,
         llm_provider=args.llm,
-        auth_token=args.token
+        auth_token=args.token,
+        enable_fcm=not args.no_fcm,
+        location_interval=args.location_interval
     )
     
     try:

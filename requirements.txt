@@ -4,6 +4,12 @@
 # Core WebSocket support
 websockets
 
+# HTTP Server & Client
+aiohttp
+
+# Firebase Cloud Messaging
+firebase-admin
+
 # Audio processing (for main.py and demo_client.py)
 # PyAudio
 
