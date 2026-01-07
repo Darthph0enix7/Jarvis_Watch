@@ -1356,6 +1356,15 @@ class HTTPAPIServer:
         """Setup HTTP and WebSocket routes."""
         # WebSocket endpoint for voice assistant
         self.app.router.add_get('/ws', self.websocket_handler)
+        self.app.router.add_get('/ws/locations', self.location_websocket_handler)
+        
+        # Web dashboard
+        self.app.router.add_get('/', self.serve_dashboard)
+        self.app.router.add_get('/dashboard', self.serve_dashboard)
+        
+        # Location API endpoints
+        self.app.router.add_get('/api/locations', self.get_locations)
+        self.app.router.add_get('/api/locations/{device_id}', self.get_device_locations)
         
         # HTTP API endpoints for FCM and device management
         self.app.router.add_post('/api/register-device', self.register_device)
@@ -1377,6 +1386,92 @@ class HTTPAPIServer:
         """Validate authentication token from query parameter."""
         token = request.query.get('token')
         return token == self.auth_token
+    
+    async def serve_dashboard(self, request: web.Request) -> web.Response:
+        """Serve the location tracking dashboard."""
+        html_path = Path(__file__).parent / 'dashboard.html'
+        if html_path.exists():
+            return web.FileResponse(html_path)
+        else:
+            # Return inline HTML if file doesn't exist
+            return web.Response(text="Dashboard not found. Run setup to create dashboard.html", content_type='text/html')
+    
+    async def get_locations(self, request: web.Request) -> web.Response:
+        """Get location data with optional filtering."""
+        try:
+            limit = int(request.query.get('limit', 20))
+            device_id = request.query.get('device_id')
+            
+            # Read locations from file
+            locations = []
+            if Path(self.location_tracker.filepath).exists():
+                with open(self.location_tracker.filepath, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            loc = json.loads(line)
+                            if device_id is None or loc['device_id'] == device_id:
+                                locations.append(loc)
+            
+            # Sort by timestamp descending and limit
+            locations.sort(key=lambda x: x['timestamp'], reverse=True)
+            locations = locations[:limit]
+            
+            return web.json_response({
+                'locations': locations,
+                'count': len(locations),
+                'limit': limit
+            })
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
+    
+    async def get_device_locations(self, request: web.Request) -> web.Response:
+        """Get locations for a specific device."""
+        device_id = request.match_info['device_id']
+        limit = int(request.query.get('limit', 20))
+        
+        try:
+            locations = []
+            if Path(self.location_tracker.filepath).exists():
+                with open(self.location_tracker.filepath, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            loc = json.loads(line)
+                            if loc['device_id'] == device_id:
+                                locations.append(loc)
+            
+            # Sort by timestamp descending and limit
+            locations.sort(key=lambda x: x['timestamp'], reverse=True)
+            locations = locations[:limit]
+            
+            return web.json_response({
+                'device_id': device_id,
+                'locations': locations,
+                'count': len(locations)
+            })
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
+    
+    async def location_websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
+        """WebSocket handler for real-time location updates."""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        # Store websocket for broadcasting
+        if not hasattr(self, 'location_ws_clients'):
+            self.location_ws_clients = set()
+        self.location_ws_clients.add(ws)
+        
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    # Handle ping/pong
+                    data = json.loads(msg.data)
+                    if data.get('type') == 'ping':
+                        await ws.send_json({'type': 'pong'})
+        finally:
+            self.location_ws_clients.discard(ws)
+        
+        return ws
     
     async def websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
         """Handle WebSocket connections for voice assistant."""
@@ -1588,9 +1683,19 @@ class HTTPAPIServer:
             print(f"[Location] Full data: {json.dumps(data, indent=2)}")
             
             # Update last seen
-            self.device_manager.update_last_seen(device_id)
+            if self.device_manager:
+                self.device_manager.update_last_seen(device_id)
             
-            # Here you could store location in database, trigger geofencing, etc.
+            # Broadcast to WebSocket clients
+            if hasattr(self, 'location_ws_clients'):
+                for ws in list(self.location_ws_clients):
+                    try:
+                        await ws.send_json({
+                            'type': 'location_update',
+                            'data': data
+                        })
+                    except:
+                        self.location_ws_clients.discard(ws)
             
             return web.json_response({'status': 'received', 'device_id': device_id})
         except Exception as e:
@@ -1651,6 +1756,17 @@ class HTTPAPIServer:
                     # Save to tracker
                     self.location_tracker.update_location(location)
                     print(f"  ✓ Location saved to {self.location_tracker.filepath}")
+                    
+                    # Broadcast to WebSocket clients
+                    if hasattr(self, 'location_ws_clients'):
+                        for ws in list(self.location_ws_clients):
+                            try:
+                                await ws.send_json({
+                                    'type': 'location_update',
+                                    'data': location.to_dict()
+                                })
+                            except:
+                                self.location_ws_clients.discard(ws)
                     
                 else:
                     error = data.get('error', 'Unknown error')

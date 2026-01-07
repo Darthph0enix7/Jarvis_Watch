@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS Location Tracker</title>
+    
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #2563eb;
+            --primary-dark: #1e40af;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --dark: #1f2937;
+            --light: #f3f4f6;
+            --border: #e5e7eb;
+            --text: #374151;
+            --text-light: #6b7280;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            border-radius: 16px;
+            padding: 24px 32px;
+            margin-bottom: 24px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 16px;
+        }
+
+        .header h1 {
+            color: var(--dark);
+            font-size: 28px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .status-badge.online {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .status-badge.offline {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        .status-dot.online {
+            background: #10b981;
+        }
+
+        .status-dot.offline {
+            background: #ef4444;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .control-group label {
+            font-size: 14px;
+            color: var(--text-light);
+            font-weight: 500;
+        }
+
+        .control-group select,
+        .control-group input {
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 14px;
+            outline: none;
+            transition: all 0.2s;
+        }
+
+        .control-group select:focus,
+        .control-group input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--primary-dark);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+        }
+
+        .btn-secondary {
+            background: var(--secondary);
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #059669;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+        }
+
+        .content {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 24px;
+        }
+
+        @media (max-width: 1200px) {
+            .content {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .map-container {
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            height: 700px;
+        }
+
+        #map {
+            width: 100%;
+            height: 100%;
+        }
+
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+        }
+
+        .card h2 {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--dark);
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+        }
+
+        .stat {
+            text-align: center;
+            padding: 12px;
+            background: var(--light);
+            border-radius: 8px;
+        }
+
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--primary);
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: var(--text-light);
+            margin-top: 4px;
+        }
+
+        .location-list {
+            max-height: 450px;
+            overflow-y: auto;
+        }
+
+        .location-item {
+            padding: 12px;
+            border-left: 3px solid var(--border);
+            margin-bottom: 12px;
+            background: var(--light);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .location-item:hover {
+            transform: translateX(4px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+
+        .location-item.latest {
+            border-left-color: var(--secondary);
+            background: #d1fae5;
+        }
+
+        .location-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .location-time {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--dark);
+        }
+
+        .location-badge {
+            font-size: 11px;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-weight: 600;
+        }
+
+        .location-badge.latest {
+            background: var(--secondary);
+            color: white;
+        }
+
+        .location-badge.past {
+            background: var(--border);
+            color: var(--text-light);
+        }
+
+        .location-coords {
+            font-size: 12px;
+            color: var(--text-light);
+            font-family: 'Courier New', monospace;
+        }
+
+        .location-meta {
+            display: flex;
+            gap: 12px;
+            margin-top: 8px;
+            font-size: 11px;
+            color: var(--text-light);
+        }
+
+        .location-meta span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        /* Scrollbar styling */
+        .location-list::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .location-list::-webkit-scrollbar-track {
+            background: var(--light);
+            border-radius: 4px;
+        }
+
+        .location-list::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 4px;
+        }
+
+        .location-list::-webkit-scrollbar-thumb:hover {
+            background: var(--text-light);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-light);
+        }
+
+        .empty-state svg {
+            width: 64px;
+            height: 64px;
+            margin-bottom: 16px;
+            opacity: 0.3;
+        }
+
+        .device-selector {
+            padding: 12px;
+            background: var(--light);
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+
+        .device-option {
+            padding: 8px 12px;
+            margin: 4px 0;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .device-option:hover {
+            background: white;
+        }
+
+        .device-option.active {
+            background: var(--primary);
+            color: white;
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: var(--dark);
+            color: white;
+            padding: 16px 24px;
+            border-radius: 8px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            display: none;
+            animation: slideIn 0.3s ease;
+        }
+
+        .toast.show {
+            display: block;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(100px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: var(--text-light);
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 12px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1>
+                    📍 JARVIS Location Tracker
+                    <span class="status-badge online" id="connectionStatus">
+                        <span class="status-dot online"></span>
+                        Connected
+                    </span>
+                </h1>
+            </div>
+            <div class="controls">
+                <div class="control-group">
+                    <label for="limitSelect">Show:</label>
+                    <select id="limitSelect">
+                        <option value="10">Last 10</option>
+                        <option value="20" selected>Last 20</option>
+                        <option value="50">Last 50</option>
+                        <option value="100">Last 100</option>
+                        <option value="500">Last 500</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" id="refreshBtn">
+                    🔄 Refresh
+                </button>
+                <button class="btn btn-secondary" id="requestLocationBtn">
+                    📡 Request Update
+                </button>
+            </div>
+        </div>
+
+        <div class="content">
+            <div class="map-container">
+                <div id="map"></div>
+            </div>
+
+            <div class="sidebar">
+                <div class="card">
+                    <h2>📊 Statistics</h2>
+                    <div class="stats-grid">
+                        <div class="stat">
+                            <div class="stat-value" id="totalLocations">0</div>
+                            <div class="stat-label">Locations</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="totalDevices">0</div>
+                            <div class="stat-label">Devices</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="avgAccuracy">0</div>
+                            <div class="stat-label">Avg Accuracy (m)</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="lastUpdate">-</div>
+                            <div class="stat-label">Last Update</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>📱 Devices</h2>
+                    <div id="deviceSelector" class="device-selector">
+                        <div class="loading">
+                            <div class="spinner"></div>
+                            Loading devices...
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>📍 Location History</h2>
+                    <div id="locationList" class="location-list">
+                        <div class="loading">
+                            <div class="spinner"></div>
+                            Loading locations...
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <script>
+        // Configuration
+        const API_BASE = window.location.origin;
+        const WS_URL = `ws://${window.location.host}/ws/locations`;
+        
+        // State
+        let map;
+        let markers = [];
+        let polyline;
+        let ws;
+        let locations = [];
+        let devices = new Set();
+        let selectedDevice = null;
+
+        // Initialize map
+        function initMap() {
+            map = L.map('map').setView([51.505, -0.09], 13);
+            
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors',
+                maxZoom: 19
+            }).addTo(map);
+        }
+
+        // Show toast notification
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 3000);
+        }
+
+        // Format timestamp
+        function formatTime(timestamp) {
+            const date = new Date(timestamp * 1000);
+            return date.toLocaleTimeString('en-US', { 
+                hour: '2-digit', 
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
+        function formatRelativeTime(timestamp) {
+            const now = Date.now();
+            const diff = now - (timestamp * 1000);
+            const seconds = Math.floor(diff / 1000);
+            const minutes = Math.floor(seconds / 60);
+            const hours = Math.floor(minutes / 60);
+            
+            if (seconds < 60) return `${seconds}s ago`;
+            if (minutes < 60) return `${minutes}m ago`;
+            return `${hours}h ago`;
+        }
+
+        // Update statistics
+        function updateStats() {
+            const totalLocs = locations.length;
+            const uniqueDevices = new Set(locations.map(l => l.device_id)).size;
+            const avgAcc = totalLocs > 0 
+                ? Math.round(locations.reduce((sum, l) => sum + l.accuracy, 0) / totalLocs)
+                : 0;
+            const lastUpdateTime = totalLocs > 0 
+                ? formatRelativeTime(locations[0].timestamp)
+                : '-';
+
+            document.getElementById('totalLocations').textContent = totalLocs;
+            document.getElementById('totalDevices').textContent = uniqueDevices;
+            document.getElementById('avgAccuracy').textContent = avgAcc;
+            document.getElementById('lastUpdate').textContent = lastUpdateTime;
+        }
+
+        // Render device selector
+        function renderDeviceSelector() {
+            const container = document.getElementById('deviceSelector');
+            const deviceList = Array.from(devices);
+
+            if (deviceList.length === 0) {
+                container.innerHTML = '<div class="empty-state">No devices found</div>';
+                return;
+            }
+
+            let html = '<div class="device-option ' + (selectedDevice === null ? 'active' : '') + '" onclick="selectDevice(null)">';
+            html += '<span>🌍 All Devices</span>';
+            html += '<span>' + locations.length + '</span>';
+            html += '</div>';
+
+            deviceList.forEach(deviceId => {
+                const deviceLocs = locations.filter(l => l.device_id === deviceId);
+                const isActive = selectedDevice === deviceId;
+                html += `<div class="device-option ${isActive ? 'active' : ''}" onclick="selectDevice('${deviceId}')">`;
+                html += `<span>📱 ${deviceId.substring(0, 8)}...</span>`;
+                html += `<span>${deviceLocs.length}</span>`;
+                html += '</div>';
+            });
+
+            container.innerHTML = html;
+        }
+
+        // Select device filter
+        function selectDevice(deviceId) {
+            selectedDevice = deviceId;
+            loadLocations();
+        }
+
+        // Render location list
+        function renderLocationList() {
+            const container = document.getElementById('locationList');
+            
+            if (locations.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                  d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                  d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/>
+                        </svg>
+                        <div>No locations yet</div>
+                    </div>
+                `;
+                return;
+            }
+
+            let html = '';
+            locations.forEach((loc, index) => {
+                const isLatest = index === 0;
+                const time = formatTime(loc.timestamp);
+                const relTime = formatRelativeTime(loc.timestamp);
+                
+                html += `<div class="location-item ${isLatest ? 'latest' : ''}" onclick="focusLocation(${index})">`;
+                html += '<div class="location-header">';
+                html += `<span class="location-time">${time}</span>`;
+                html += `<span class="location-badge ${isLatest ? 'latest' : 'past'}">${isLatest ? '📍 Latest' : relTime}</span>`;
+                html += '</div>';
+                html += `<div class="location-coords">${loc.latitude.toFixed(6)}, ${loc.longitude.toFixed(6)}</div>`;
+                html += '<div class="location-meta">';
+                html += `<span>📱 ${loc.device_id.substring(0, 8)}</span>`;
+                html += `<span>📊 ±${Math.round(loc.accuracy)}m</span>`;
+                if (loc.speed && loc.speed > 0) {
+                    html += `<span>🚗 ${(loc.speed * 3.6).toFixed(1)} km/h</span>`;
+                }
+                html += '</div>';
+                html += '</div>';
+            });
+
+            container.innerHTML = html;
+        }
+
+        // Focus on a location
+        function focusLocation(index) {
+            const loc = locations[index];
+            map.setView([loc.latitude, loc.longitude], 16);
+            markers[index].openPopup();
+        }
+
+        // Update map markers
+        function updateMap() {
+            // Clear existing markers and polyline
+            markers.forEach(m => map.removeLayer(m));
+            markers = [];
+            if (polyline) map.removeLayer(polyline);
+
+            if (locations.length === 0) return;
+
+            // Create polyline connecting locations (in chronological order)
+            const points = locations.slice().reverse().map(loc => [loc.latitude, loc.longitude]);
+            polyline = L.polyline(points, {
+                color: '#2563eb',
+                weight: 3,
+                opacity: 0.7,
+                dashArray: '10, 5'
+            }).addTo(map);
+
+            // Add markers for each location
+            locations.forEach((loc, index) => {
+                const isLatest = index === 0;
+                
+                // Create custom icon
+                const iconHtml = isLatest 
+                    ? '<div style="background: #10b981; color: white; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">📍</div>'
+                    : '<div style="background: #2563eb; color: white; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.2);">•</div>';
+                
+                const icon = L.divIcon({
+                    html: iconHtml,
+                    className: 'custom-marker',
+                    iconSize: [isLatest ? 32 : 24, isLatest ? 32 : 24],
+                    iconAnchor: [isLatest ? 16 : 12, isLatest ? 16 : 12]
+                });
+
+                // Create popup content
+                const time = formatTime(loc.timestamp);
+                const popupContent = `
+                    <div style="min-width: 200px;">
+                        <strong>${isLatest ? '📍 Latest Location' : '📌 Previous Location'}</strong><br>
+                        <small>${time} (${formatRelativeTime(loc.timestamp)})</small><br>
+                        <hr style="margin: 8px 0; border: none; border-top: 1px solid #e5e7eb;">
+                        <strong>📱 Device:</strong> ${loc.device_id.substring(0, 12)}...<br>
+                        <strong>📊 Accuracy:</strong> ±${Math.round(loc.accuracy)}m<br>
+                        <strong>📍 Coordinates:</strong> ${loc.latitude.toFixed(6)}, ${loc.longitude.toFixed(6)}<br>
+                        ${loc.altitude ? `<strong>🏔️ Altitude:</strong> ${Math.round(loc.altitude)}m<br>` : ''}
+                        ${loc.speed && loc.speed > 0 ? `<strong>🚗 Speed:</strong> ${(loc.speed * 3.6).toFixed(1)} km/h<br>` : ''}
+                        ${loc.provider ? `<strong>📡 Provider:</strong> ${loc.provider}` : ''}
+                    </div>
+                `;
+
+                const marker = L.marker([loc.latitude, loc.longitude], { icon })
+                    .bindPopup(popupContent)
+                    .addTo(map);
+                
+                markers.push(marker);
+            });
+
+            // Fit map to show all markers
+            if (points.length > 0) {
+                map.fitBounds(polyline.getBounds(), { padding: [50, 50] });
+            }
+        }
+
+        // Load locations from API
+        async function loadLocations() {
+            try {
+                const limit = document.getElementById('limitSelect').value;
+                const url = selectedDevice 
+                    ? `${API_BASE}/api/locations/${selectedDevice}?limit=${limit}`
+                    : `${API_BASE}/api/locations?limit=${limit}`;
+                
+                const response = await fetch(url);
+                const data = await response.json();
+                
+                locations = data.locations || [];
+                
+                // Update devices set
+                devices.clear();
+                locations.forEach(loc => devices.add(loc.device_id));
+                
+                // Update UI
+                updateStats();
+                renderDeviceSelector();
+                renderLocationList();
+                updateMap();
+                
+                showToast(`✓ Loaded ${locations.length} locations`);
+            } catch (error) {
+                console.error('Failed to load locations:', error);
+                showToast('✗ Failed to load locations');
+            }
+        }
+
+        // Request location update
+        async function requestLocationUpdate() {
+            try {
+                const response = await fetch(`${API_BASE}/api/request-location-all`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.status === 'sent') {
+                    showToast(`✓ Location request sent to ${data.success_count} device(s)`);
+                } else {
+                    showToast('✗ Failed to request location');
+                }
+            } catch (error) {
+                console.error('Failed to request location:', error);
+                showToast('✗ Failed to request location');
+            }
+        }
+
+        // Initialize WebSocket connection
+        function initWebSocket() {
+            ws = new WebSocket(WS_URL);
+            
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                updateConnectionStatus(true);
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === 'location_update') {
+                    console.log('New location received:', data.data);
+                    
+                    // Add new location to the beginning
+                    locations.unshift(data.data);
+                    
+                    // Trim to limit
+                    const limit = parseInt(document.getElementById('limitSelect').value);
+                    if (locations.length > limit) {
+                        locations = locations.slice(0, limit);
+                    }
+                    
+                    // Update devices set
+                    devices.add(data.data.device_id);
+                    
+                    // Update UI
+                    updateStats();
+                    renderDeviceSelector();
+                    renderLocationList();
+                    updateMap();
+                    
+                    showToast('📍 New location received!');
+                }
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                updateConnectionStatus(false);
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                updateConnectionStatus(false);
+                
+                // Attempt to reconnect after 5 seconds
+                setTimeout(initWebSocket, 5000);
+            };
+            
+            // Send periodic ping to keep connection alive
+            setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'ping' }));
+                }
+            }, 30000);
+        }
+
+        // Update connection status
+        function updateConnectionStatus(connected) {
+            const statusBadge = document.getElementById('connectionStatus');
+            if (connected) {
+                statusBadge.innerHTML = '<span class="status-dot online"></span> Connected';
+                statusBadge.className = 'status-badge online';
+            } else {
+                statusBadge.innerHTML = '<span class="status-dot offline"></span> Disconnected';
+                statusBadge.className = 'status-badge offline';
+            }
+        }
+
+        // Event listeners
+        document.getElementById('refreshBtn').addEventListener('click', loadLocations);
+        document.getElementById('requestLocationBtn').addEventListener('click', requestLocationUpdate);
+        document.getElementById('limitSelect').addEventListener('change', loadLocations);
+
+        // Make selectDevice globally accessible
+        window.selectDevice = selectDevice;
+        window.focusLocation = focusLocation;
+
+        // Initialize on page load
+        window.addEventListener('DOMContentLoaded', () => {
+            initMap();
+            loadLocations();
+            initWebSocket();
+            
+            // Auto-refresh every 30 seconds
+            setInterval(updateStats, 30000);
+        });
+    </script>
+</body>
+</html>
