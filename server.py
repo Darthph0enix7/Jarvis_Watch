@@ -2122,7 +2122,7 @@ def main():
                         help="Authentication token (default: from JARVIS_AUTH_TOKEN env or 'Denemeler123.')")
     parser.add_argument("--no-fcm", action="store_true",
                         help="Disable FCM functionality")
-    parser.add_argument("--location-interval", type=int, default=30,
+    parser.add_argument("--location-interval", type=int, default=1,
                         help="Location tracking interval in minutes (default: 30)")
     parser.add_argument("--reload", action="store_true",
                         help="Enable auto-reload on file changes")
