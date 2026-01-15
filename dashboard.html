@@ -524,11 +524,35 @@
         // State
         let map;
         let markers = [];
-        let polyline;
+        let polylines = {};  // Track polylines per device type
         let ws;
         let locations = [];
         let devices = new Set();
+        let deviceTypes = new Set();
         let selectedDevice = null;
+        let selectedDeviceType = null;
+        
+        // Color scheme for different device types
+        const deviceColors = {
+            'phone': '#2563eb',     // Blue
+            'watch': '#10b981',     // Green
+            'tablet': '#f59e0b',    // Orange
+            'laptop': '#8b5cf6',    // Purple
+            'desktop': '#ef4444',   // Red
+            'unknown': '#6b7280'    // Gray
+        };
+        
+        // Get color for device type (or generate one if new type)
+        function getDeviceColor(deviceType) {
+            if (deviceColors[deviceType]) {
+                return deviceColors[deviceType];
+            }
+            // Generate a random color for unknown device types
+            const colors = ['#06b6d4', '#ec4899', '#f97316', '#84cc16', '#a855f7'];
+            const index = Object.keys(deviceColors).length % colors.length;
+            deviceColors[deviceType] = colors[index];
+            return deviceColors[deviceType];
+        }
 
         // Initialize map
         function initMap() {
@@ -574,6 +598,7 @@
         function updateStats() {
             const totalLocs = locations.length;
             const uniqueDevices = new Set(locations.map(l => l.device_id)).size;
+            const uniqueTypes = new Set(locations.map(l => l.device_type)).size;
             const avgAcc = totalLocs > 0 
                 ? Math.round(locations.reduce((sum, l) => sum + l.accuracy, 0) / totalLocs)
                 : 0;
@@ -582,7 +607,7 @@
                 : '-';
 
             document.getElementById('totalLocations').textContent = totalLocs;
-            document.getElementById('totalDevices').textContent = uniqueDevices;
+            document.getElementById('totalDevices').textContent = `${uniqueDevices} (${uniqueTypes} types)`;
             document.getElementById('avgAccuracy').textContent = avgAcc;
             document.getElementById('lastUpdate').textContent = lastUpdateTime;
         }
@@ -590,41 +615,76 @@
         // Render device selector
         function renderDeviceSelector() {
             const container = document.getElementById('deviceSelector');
-            const deviceList = Array.from(devices);
+            
+            // Group devices by type
+            const devicesByType = {};
+            locations.forEach(loc => {
+                if (!devicesByType[loc.device_type]) {
+                    devicesByType[loc.device_type] = new Set();
+                }
+                devicesByType[loc.device_type].add(loc.device_id);
+            });
 
-            if (deviceList.length === 0) {
+            if (Object.keys(devicesByType).length === 0) {
                 container.innerHTML = '<div class="empty-state">No devices found</div>';
                 return;
             }
 
-            let html = '<div class="device-option ' + (selectedDevice === null ? 'active' : '') + '" onclick="selectDevice(null)">';
+            let html = '<div class="device-option ' + (selectedDevice === null && selectedDeviceType === null ? 'active' : '') + '" onclick="selectDevice(null, null)">';
             html += '<span>🌍 All Devices</span>';
             html += '<span>' + locations.length + '</span>';
             html += '</div>';
 
-            deviceList.forEach(deviceId => {
-                const deviceLocs = locations.filter(l => l.device_id === deviceId);
-                const isActive = selectedDevice === deviceId;
-                html += `<div class="device-option ${isActive ? 'active' : ''}" onclick="selectDevice('${deviceId}')">`;
-                html += `<span>📱 ${deviceId.substring(0, 8)}...</span>`;
-                html += `<span>${deviceLocs.length}</span>`;
+            // Render by device type first
+            Object.keys(devicesByType).sort().forEach(deviceType => {
+                const deviceIds = Array.from(devicesByType[deviceType]);
+                const typeLocs = locations.filter(l => l.device_type === deviceType);
+                const typeColor = getDeviceColor(deviceType);
+                const isTypeActive = selectedDeviceType === deviceType && selectedDevice === null;
+                
+                // Device type header
+                const typeEmoji = deviceType === 'phone' ? '📱' : deviceType === 'watch' ? '⌚' : '📟';
+                html += `<div class="device-option ${isTypeActive ? 'active' : ''}" onclick="selectDevice(null, '${deviceType}')" style="font-weight: bold; border-left: 3px solid ${typeColor};">`;
+                html += `<span>${typeEmoji} ${deviceType.toUpperCase()}</span>`;
+                html += `<span>${typeLocs.length}</span>`;
                 html += '</div>';
+                
+                // Individual devices under this type
+                deviceIds.forEach(deviceId => {
+                    const deviceLocs = locations.filter(l => l.device_id === deviceId && l.device_type === deviceType);
+                    const isActive = selectedDevice === deviceId;
+                    html += `<div class="device-option ${isActive ? 'active' : ''}" onclick="selectDevice('${deviceId}', '${deviceType}')" style="padding-left: 24px; border-left: 2px solid ${typeColor};">`;
+                    html += `<span>  └ ${deviceId.substring(0, 10)}...</span>`;
+                    html += `<span>${deviceLocs.length}</span>`;
+                    html += '</div>';
+                });
             });
 
             container.innerHTML = html;
         }
 
         // Select device filter
-        function selectDevice(deviceId) {
+        function selectDevice(deviceId, deviceType) {
             selectedDevice = deviceId;
-            loadLocations();
+            selectedDeviceType = deviceType;
+            renderDeviceSelector();
+            renderLocationList();
+            updateMap();
         }
 
         // Render location list
         function renderLocationList() {
             const container = document.getElementById('locationList');
             
-            if (locations.length === 0) {
+            // Filter locations based on selection
+            let filteredLocs = locations;
+            if (selectedDevice) {
+                filteredLocs = locations.filter(l => l.device_id === selectedDevice);
+            } else if (selectedDeviceType) {
+                filteredLocs = locations.filter(l => l.device_type === selectedDeviceType);
+            }
+            
+            if (filteredLocs.length === 0) {
                 container.innerHTML = `
                     <div class="empty-state">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -640,19 +700,22 @@
             }
 
             let html = '';
-            locations.forEach((loc, index) => {
+            filteredLocs.forEach((loc, index) => {
                 const isLatest = index === 0;
                 const time = formatTime(loc.timestamp);
                 const relTime = formatRelativeTime(loc.timestamp);
+                const deviceColor = getDeviceColor(loc.device_type);
+                const typeEmoji = loc.device_type === 'phone' ? '📱' : loc.device_type === 'watch' ? '⌚' : '📟';
                 
-                html += `<div class="location-item ${isLatest ? 'latest' : ''}" onclick="focusLocation(${index})">`;
+                html += `<div class="location-item ${isLatest ? 'latest' : ''}" onclick="focusLocation(${index})" style="border-left-color: ${deviceColor}">`;
                 html += '<div class="location-header">';
                 html += `<span class="location-time">${time}</span>`;
                 html += `<span class="location-badge ${isLatest ? 'latest' : 'past'}">${isLatest ? '📍 Latest' : relTime}</span>`;
                 html += '</div>';
                 html += `<div class="location-coords">${loc.latitude.toFixed(6)}, ${loc.longitude.toFixed(6)}</div>`;
                 html += '<div class="location-meta">';
-                html += `<span>📱 ${loc.device_id.substring(0, 8)}</span>`;
+                html += `<span style="color: ${deviceColor}; font-weight: bold;">${typeEmoji} ${loc.device_type.toUpperCase()}</span>`;
+                html += `<span>ID: ${loc.device_id.substring(0, 8)}</span>`;
                 html += `<span>📊 ±${Math.round(loc.accuracy)}m</span>`;
                 if (loc.speed && loc.speed > 0) {
                     html += `<span>🚗 ${(loc.speed * 3.6).toFixed(1)} km/h</span>`;
@@ -666,37 +729,79 @@
 
         // Focus on a location
         function focusLocation(index) {
-            const loc = locations[index];
+            // Get filtered locations
+            let filteredLocs = locations;
+            if (selectedDevice) {
+                filteredLocs = locations.filter(l => l.device_id === selectedDevice);
+            } else if (selectedDeviceType) {
+                filteredLocs = locations.filter(l => l.device_type === selectedDeviceType);
+            }
+            
+            const loc = filteredLocs[index];
+            const globalIndex = locations.indexOf(loc);
+            
             map.setView([loc.latitude, loc.longitude], 16);
-            markers[index].openPopup();
+            if (markers[globalIndex]) {
+                markers[globalIndex].openPopup();
+            }
         }
 
         // Update map markers
         function updateMap() {
-            // Clear existing markers and polyline
+            // Clear existing markers and polylines
             markers.forEach(m => map.removeLayer(m));
             markers = [];
-            if (polyline) map.removeLayer(polyline);
+            Object.values(polylines).forEach(p => map.removeLayer(p));
+            polylines = {};
 
-            if (locations.length === 0) return;
+            // Filter locations based on selection
+            let filteredLocs = locations;
+            if (selectedDevice) {
+                filteredLocs = locations.filter(l => l.device_id === selectedDevice);
+            } else if (selectedDeviceType) {
+                filteredLocs = locations.filter(l => l.device_type === selectedDeviceType);
+            }
 
-            // Create polyline connecting locations (in chronological order)
-            const points = locations.slice().reverse().map(loc => [loc.latitude, loc.longitude]);
-            polyline = L.polyline(points, {
-                color: '#2563eb',
-                weight: 3,
-                opacity: 0.7,
-                dashArray: '10, 5'
-            }).addTo(map);
+            if (filteredLocs.length === 0) return;
+
+            // Group locations by device_type for separate polylines
+            const locsByType = {};
+            filteredLocs.forEach(loc => {
+                if (!locsByType[loc.device_type]) {
+                    locsByType[loc.device_type] = [];
+                }
+                locsByType[loc.device_type].push(loc);
+            });
+
+            // Create polylines for each device type with different colors
+            const allBounds = [];
+            Object.keys(locsByType).forEach(deviceType => {
+                const typeLocs = locsByType[deviceType].slice().reverse(); // Chronological order
+                const points = typeLocs.map(loc => [loc.latitude, loc.longitude]);
+                const color = getDeviceColor(deviceType);
+                
+                const polyline = L.polyline(points, {
+                    color: color,
+                    weight: 3,
+                    opacity: 0.7,
+                    dashArray: '10, 5'
+                }).addTo(map);
+                
+                polylines[deviceType] = polyline;
+                allBounds.push(...points);
+            });
 
             // Add markers for each location
-            locations.forEach((loc, index) => {
+            filteredLocs.forEach((loc, index) => {
+                const globalIndex = locations.indexOf(loc);
                 const isLatest = index === 0;
+                const color = getDeviceColor(loc.device_type);
+                const typeEmoji = loc.device_type === 'phone' ? '📱' : loc.device_type === 'watch' ? '⌚' : '📟';
                 
-                // Create custom icon
+                // Create custom icon with device type color
                 const iconHtml = isLatest 
-                    ? '<div style="background: #10b981; color: white; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">📍</div>'
-                    : '<div style="background: #2563eb; color: white; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.2);">•</div>';
+                    ? `<div style="background: ${color}; color: white; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">${typeEmoji}</div>`
+                    : `<div style="background: ${color}; color: white; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.2);">•</div>`;
                 
                 const icon = L.divIcon({
                     html: iconHtml,
@@ -709,10 +814,10 @@
                 const time = formatTime(loc.timestamp);
                 const popupContent = `
                     <div style="min-width: 200px;">
-                        <strong>${isLatest ? '📍 Latest Location' : '📌 Previous Location'}</strong><br>
+                        <strong style="color: ${color};">${typeEmoji} ${loc.device_type.toUpperCase()} ${isLatest ? '- Latest' : ''}</strong><br>
                         <small>${time} (${formatRelativeTime(loc.timestamp)})</small><br>
                         <hr style="margin: 8px 0; border: none; border-top: 1px solid #e5e7eb;">
-                        <strong>📱 Device:</strong> ${loc.device_id.substring(0, 12)}...<br>
+                        <strong>📱 Device ID:</strong> ${loc.device_id.substring(0, 12)}...<br>
                         <strong>📊 Accuracy:</strong> ±${Math.round(loc.accuracy)}m<br>
                         <strong>📍 Coordinates:</strong> ${loc.latitude.toFixed(6)}, ${loc.longitude.toFixed(6)}<br>
                         ${loc.altitude ? `<strong>🏔️ Altitude:</strong> ${Math.round(loc.altitude)}m<br>` : ''}
@@ -725,12 +830,12 @@
                     .bindPopup(popupContent)
                     .addTo(map);
                 
-                markers.push(marker);
+                markers[globalIndex] = marker;
             });
 
             // Fit map to show all markers
-            if (points.length > 0) {
-                map.fitBounds(polyline.getBounds(), { padding: [50, 50] });
+            if (allBounds.length > 0) {
+                map.fitBounds(allBounds, { padding: [50, 50] });
             }
         }
 
@@ -747,9 +852,13 @@
                 
                 locations = data.locations || [];
                 
-                // Update devices set
+                // Update devices and types sets
                 devices.clear();
-                locations.forEach(loc => devices.add(loc.device_id));
+                deviceTypes.clear();
+                locations.forEach(loc => {
+                    devices.add(loc.device_id);
+                    deviceTypes.add(loc.device_type);
+                });
                 
                 // Update UI
                 updateStats();
@@ -807,8 +916,9 @@
                         locations = locations.slice(0, limit);
                     }
                     
-                    // Update devices set
+                    // Update devices and types sets
                     devices.add(data.data.device_id);
+                    deviceTypes.add(data.data.device_type);
                     
                     // Update UI
                     updateStats();
