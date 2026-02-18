@@ -35,7 +35,7 @@ CARTESIA_STT_URL = "wss://api.cartesia.ai/stt/websocket"
 CARTESIA_TTS_URL = "wss://api.cartesia.ai/tts/websocket"
 
 # TTS configuration
-TTS_VOICE_ID = "ffe42012-140d-40ab-8cc3-d3f0e957dbc9"
+TTS_VOICE_ID = "5ee9feff-1265-424a-9d7f-8e4d431a12c7"
 TTS_MODEL = "sonic-3-2025-10-27"
 TTS_SPEED = 1.2
 TTS_VOLUME = 1.5
