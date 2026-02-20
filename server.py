@@ -56,6 +56,9 @@ FIREBASE_SERVICE_ACCOUNT = "jarvis-app-43084-firebase-adminsdk-fbsvc-c836619551.
 GEMINI_MODEL = "models/gemini-2.5-flash-lite"
 CEREBRAS_MODEL = "gpt-oss-120b"
 
+# Transform endpoint rate limiting
+TRANSFORM_RATE_LIMIT = 30  # max requests per minute per IP
+
 # Cartesia STT parameters
 CARTESIA_PARAMS = {
     "api_key": CARTESIA_API_KEY,
@@ -84,6 +87,145 @@ def create_llm_client(provider: str = "cerebras"):
 
 
 # ============================================================================
+# TEXT TRANSFORMER (for /api/transform endpoint)
+# ============================================================================
+
+# Configurable system prompt for the transform endpoint
+TRANSFORM_SYSTEM_PROMPT = (
+    "You are a text corrector assistant. "
+    "Process the user's text exactly as instructed and return only the result, "
+    "with no additional commentary, explanation, or formatting."
+    "i want you to correct the text i have written, but keep it in the vibe and sound as i written and keep the acronyms as they are like, u, jz, etc. "
+    "keep the language that i written the text in that might be english, german anything keep that language in your response"
+    "so just correct the small grammer mistakes like in german the artikel mistakes like der, des oder zur, zu, zum etc."
+    "and generally but like i said keep the style that i ve written"
+    "but if i write somethin inside a {} curly braces and it really doenst fit the context, they are my query spesific instructions and use those instruction as your base like i might occasionally write something informal but want u to write it more professionally and formal do that and not as i described before, but only if i instructed u about it "
+)
+
+
+class TextTransformer:
+    """Stateless LLM text transformer for the /api/transform endpoint.
+
+    Completely separate from the voice assistant pipeline.
+    No memory, no streaming, no TTS - just text in, text out.
+    """
+
+    def __init__(self, provider: str = "cerebras", system_prompt: str = TRANSFORM_SYSTEM_PROMPT):
+        self.provider = provider
+        self.system_prompt = system_prompt
+
+        if provider == "cerebras":
+            from cerebras.cloud.sdk import Cerebras as _Cerebras
+            self._client = _Cerebras(api_key=CEREBRAS_API_KEY)
+            self._model = CEREBRAS_MODEL
+        elif provider == "gemini":
+            from google import genai as _genai
+            self._client = _genai.Client(api_key=GEMINI_API_KEY)
+            self._model = GEMINI_MODEL
+        else:
+            raise ValueError(f"Unknown LLM provider: {provider}")
+
+    async def transform(self, text: str) -> str:
+        """Send text to the LLM and return the processed result."""
+        loop = asyncio.get_event_loop()
+
+        if self.provider == "cerebras":
+            def _call():
+                response = self._client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": text},
+                    ],
+                    model=self._model,
+                    stream=False,
+                    max_tokens=1024,
+                )
+                return response.choices[0].message.content
+
+            return await loop.run_in_executor(None, _call)
+
+        elif self.provider == "gemini":
+            def _call():
+                response = self._client.models.generate_content(
+                    model=self._model,
+                    contents=text,
+                    config={
+                        "system_instruction": self.system_prompt,
+                        "max_output_tokens": 1024,
+                    },
+                )
+                return response.text
+
+            return await loop.run_in_executor(None, _call)
+
+
+# ============================================================================
+# RATE LIMITER & AUTH MIDDLEWARE
+# ============================================================================
+
+class RateLimiter:
+    """Simple in-memory per-key rate limiter with a sliding window."""
+
+    def __init__(self, max_requests: int, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._buckets: dict[str, list[float]] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        cutoff = now - self.window_seconds
+        bucket = [t for t in self._buckets.get(key, []) if t > cutoff]
+        if len(bucket) >= self.max_requests:
+            self._buckets[key] = bucket
+            return False
+        bucket.append(now)
+        self._buckets[key] = bucket
+        return True
+
+
+def _make_auth_middleware(auth_token: str):
+    """Enforce token auth on every route and add security headers to all HTTP responses.
+
+    Clients must supply the token via:
+      - Query param:  ?token=<token>
+      - HTTP header:  Authorization: Bearer <token>
+    """
+
+    @web.middleware
+    async def middleware(request: web.Request, handler):
+        auth_header = request.headers.get('Authorization', '')
+        bearer = auth_header[7:].strip() if auth_header.startswith('Bearer ') else ''
+        token = request.query.get('token') or bearer
+
+        if token != auth_token:
+            if request.path.rstrip('/') in ('', '/dashboard'):
+                return web.Response(
+                    text=(
+                        '<h1>401 Unauthorized</h1>'
+                        '<p>Append <code>?token=YOUR_TOKEN</code> to the URL.</p>'
+                    ),
+                    content_type='text/html',
+                    status=401,
+                )
+            return web.json_response(
+                {'error': 'Unauthorized: invalid or missing token'}, status=401
+            )
+
+        response = await handler(request)
+
+        # Security headers — skip WebSocket upgrades (already sent)
+        if not isinstance(response, web.WebSocketResponse):
+            response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+            response.headers.setdefault('X-Frame-Options', 'DENY')
+            response.headers.setdefault('X-XSS-Protection', '1; mode=block')
+            response.headers.setdefault('Referrer-Policy', 'no-referrer')
+
+        return response
+
+    return middleware
+
+
+# ============================================================================
 # HTTP REST API (for device registration & FCM)
 # ============================================================================
 
@@ -92,7 +234,8 @@ class HTTPAPIServer:
     
     def __init__(self, device_manager: DeviceManager, fcm_service: FCMNotificationService, 
                  llm_provider: str, auth_token: str, location_tracker: LocationTracker,
-                 cartesia_api_key: str, cartesia_params: dict):
+                 cartesia_api_key: str, cartesia_params: dict,
+                 text_transformer: 'TextTransformer'):
         self.device_manager = device_manager
         self.fcm_service = fcm_service
         self.llm_provider = llm_provider
@@ -100,8 +243,10 @@ class HTTPAPIServer:
         self.location_tracker = location_tracker
         self.cartesia_api_key = cartesia_api_key
         self.cartesia_params = cartesia_params
-        self.app = web.Application()
+        self.text_transformer = text_transformer
+        self.app = web.Application(middlewares=[_make_auth_middleware(self.auth_token)])
         self.active_sessions: dict[str, VoiceSession] = {}
+        self._transform_limiter = RateLimiter(TRANSFORM_RATE_LIMIT)
         self.setup_routes()
     
     def setup_routes(self):
@@ -133,6 +278,9 @@ class HTTPAPIServer:
         self.app.router.add_get('/api/stats', self.get_stats)
         self.app.router.add_get('/api/debug/devices', self.debug_devices)
         self.app.router.add_delete('/api/devices/{device_id}', self.deactivate_device)
+        
+        # Text transform endpoint (keyboard app)
+        self.app.router.add_post('/api/transform', self.transform_text)
     
     def validate_token(self, request: web.Request) -> bool:
         """Validate authentication token from query parameter."""
@@ -562,6 +710,34 @@ class HTTPAPIServer:
         
         return web.json_response({'status': 'deactivated', 'device_id': device_id})
     
+    async def transform_text(self, request: web.Request) -> web.Response:
+        """Transform text via LLM - stateless, no memory, no streaming."""
+        try:
+            data = await request.json()
+            text = data.get('text', '')
+
+            if not text:
+                return web.json_response({'error': 'text is required'}, status=400)
+
+            if not text.strip():
+                return web.json_response({'result': text})
+
+            if not self._transform_limiter.is_allowed(request.remote or 'unknown'):
+                print(f"[Transform]   Rate limit exceeded for {request.remote}")
+                return web.json_response({'error': 'Rate limit exceeded. Try again later.'}, status=429)
+
+            print(f"\n[Transform] ← {request.remote}")
+            print(f"[Transform]   Input : {text!r}")
+
+            result = await self.text_transformer.transform(text)
+
+            print(f"[Transform]   Output: {result!r}")
+
+            return web.json_response({'result': result})
+        except Exception as e:
+            print(f"[Transform]   Error : {e}")
+            return web.json_response({'error': str(e)}, status=500)
+    
     async def debug_devices(self, request: web.Request) -> web.Response:
         """Debug endpoint to check device registration status."""
         from datetime import datetime
@@ -623,6 +799,10 @@ class JarvisServer:
         self.periodic_tracker: Optional[PeriodicLocationTracker] = None
         self.http_api: Optional[HTTPAPIServer] = None
         
+        # Text transformer is always created, independent of FCM
+        self.text_transformer = TextTransformer(provider=self.llm_provider)
+        print(f"[Server] TextTransformer initialized ({self.llm_provider})")
+
         if enable_fcm:
             try:
                 self.device_manager = DeviceManager(FIREBASE_SERVICE_ACCOUNT)
@@ -641,7 +821,8 @@ class JarvisServer:
                     self.auth_token,
                     self.location_tracker,
                     CARTESIA_API_KEY,
-                    CARTESIA_PARAMS
+                    CARTESIA_PARAMS,
+                    self.text_transformer
                 )
                 print("[Server] FCM services initialized")
             except Exception as e:
@@ -658,7 +839,8 @@ class JarvisServer:
                 self.auth_token,
                 self.location_tracker,
                 CARTESIA_API_KEY,
-                CARTESIA_PARAMS
+                CARTESIA_PARAMS,
+                self.text_transformer
             )
     
     async def start(self) -> None:
