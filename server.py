@@ -1,33 +1,19 @@
-"""
-Jarvis Voice Assistant - WebSocket Server
-
-This server handles the voice assistant pipeline and device management.
-
-Usage:
-    python server.py [--host HOST] [--port PORT] [--llm PROVIDER] [--token TOKEN]
-
-Example:
-    python server.py --reload --host 0.0.0.0 --port 8000 --llm cerebras
-"""
+"""Jarvis Voice Assistant - WebSocket Server."""
 
 import asyncio
 import json
-import sys
 import os
 import time
 import base64
 import argparse
-import signal
-import subprocess
 from typing import Optional
 from pathlib import Path
-from urllib.parse import urlencode
 
 from aiohttp import web
 import websockets
 
 # Import protocol definitions
-from protocol import MessageType, INPUT_SAMPLE_RATE, create_message, parse_message
+from protocol import MessageType, INPUT_SAMPLE_RATE, create_message
 
 # Import LLM providers
 from llm import GeminiLLMClient, CerebrasLLMClient
@@ -49,8 +35,11 @@ CARTESIA_API_KEY = os.environ.get("CARTESIA_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY")
 
-# Firebase configuration
-FIREBASE_SERVICE_ACCOUNT = "jarvis-app-43084-firebase-adminsdk-fbsvc-c836619551.json"
+# Firebase
+FIREBASE_SERVICE_ACCOUNT = os.environ.get(
+    "FIREBASE_SERVICE_ACCOUNT",
+    "jarvis-app-43084-firebase-adminsdk-fbsvc-c836619551.json"
+)
 
 # LLM configuration
 GEMINI_MODEL = "models/gemini-2.5-flash-lite"
@@ -70,6 +59,54 @@ CARTESIA_PARAMS = {
     "min_volume": "0.1",
     "max_silence_duration_secs": "2.0",
 }
+
+
+# ============================================================================
+# FIREBASE CREDENTIAL ENCRYPTION HELPERS
+# ============================================================================
+
+def _derive_fernet_key(token: str) -> bytes:
+    """Derive a 256-bit Fernet key from the auth token using SHA-256."""
+    import hashlib, base64
+    return base64.urlsafe_b64encode(hashlib.sha256(token.encode()).digest())
+
+
+def _load_firebase_creds(service_account_path: str, auth_token: str) -> dict:
+    """Load Firebase service account credentials.
+
+    Priority:
+      1. Plain JSON file  → load directly (local dev)
+      2. <path>.enc file  → decrypt with auth_token (cloned from repo)
+
+    Encrypted files are created with ``python encrypt_creds.py``.
+    """
+    from cryptography.fernet import Fernet, InvalidToken
+
+    plain = Path(service_account_path)
+    enc = Path(service_account_path + ".enc")
+
+    if plain.exists():
+        import json
+        with open(plain) as f:
+            return json.load(f)
+
+    if enc.exists():
+        key = _derive_fernet_key(auth_token)
+        try:
+            decrypted = Fernet(key).decrypt(enc.read_bytes())
+        except InvalidToken:
+            raise ValueError(
+                f"Failed to decrypt '{enc}' — JARVIS_AUTH_TOKEN is wrong or the file is corrupt."
+            )
+        import json
+        return json.loads(decrypted)
+
+    raise FileNotFoundError(
+        f"Firebase credentials not found.\n"
+        f"  Expected plain file : {plain}\n"
+        f"  Or encrypted file   : {enc}\n"
+        f"  To encrypt your credentials run: python encrypt_creds.py"
+    )
 
 
 # ============================================================================
@@ -193,6 +230,10 @@ def _make_auth_middleware(auth_token: str):
 
     @web.middleware
     async def middleware(request: web.Request, handler):
+        # Health check is always allowed without auth
+        if request.path == '/health':
+            return await handler(request)
+
         auth_header = request.headers.get('Authorization', '')
         bearer = auth_header[7:].strip() if auth_header.startswith('Bearer ') else ''
         token = request.query.get('token') or bearer
@@ -251,10 +292,13 @@ class HTTPAPIServer:
     
     def setup_routes(self):
         """Setup HTTP and WebSocket routes."""
-        # WebSocket endpoint for voice assistant
+        # Health check – no auth required (for Koyeb / load balancer probes)
+        self.app.router.add_get('/health', self.health_check)
+
+        # WebSocket endpoints
         self.app.router.add_get('/ws', self.websocket_handler)
         self.app.router.add_get('/ws/locations', self.location_websocket_handler)
-        
+
         # Web dashboard
         self.app.router.add_get('/', self.serve_dashboard)
         self.app.router.add_get('/dashboard', self.serve_dashboard)
@@ -286,7 +330,11 @@ class HTTPAPIServer:
         """Validate authentication token from query parameter."""
         token = request.query.get('token')
         return token == self.auth_token
-    
+
+    async def health_check(self, request: web.Request) -> web.Response:
+        """Unauthenticated health check endpoint for Koyeb / load balancers."""
+        return web.json_response({'status': 'ok'})
+
     async def serve_dashboard(self, request: web.Request) -> web.Response:
         """Serve the location tracking dashboard."""
         html_path = Path(__file__).parent / 'dashboard.html'
@@ -805,7 +853,8 @@ class JarvisServer:
 
         if enable_fcm:
             try:
-                self.device_manager = DeviceManager(FIREBASE_SERVICE_ACCOUNT)
+                firebase_creds = _load_firebase_creds(FIREBASE_SERVICE_ACCOUNT, self.auth_token)
+                self.device_manager = DeviceManager(firebase_creds)
                 self.fcm_service = FCMNotificationService(self.device_manager)
                 self.location_tracker = LocationTracker()
                 self.periodic_tracker = PeriodicLocationTracker(
@@ -886,161 +935,34 @@ class JarvisServer:
 
 
 # ============================================================================
-# AUTO-RELOAD FUNCTIONALITY
-# ============================================================================
-
-class ServerReloader:
-    """Monitors files for changes and restarts the server."""
-    
-    def __init__(self, watch_dirs=None, watch_extensions=None):
-        self.watch_dirs = watch_dirs or [Path.cwd()]
-        self.watch_extensions = watch_extensions or {'.py', '.json'}
-        self.file_mtimes = {}
-        self.process = None
-        self.should_exit = False
-        self._scan_files()
-    
-    def _scan_files(self):
-        """Scan all monitored files and store their modification times."""
-        for watch_dir in self.watch_dirs:
-            for ext in self.watch_extensions:
-                for filepath in Path(watch_dir).rglob(f'*{ext}'):
-                    try:
-                        self.file_mtimes[filepath] = filepath.stat().st_mtime
-                    except OSError:
-                        pass
-    
-    def check_for_changes(self) -> bool:
-        """Check if any monitored files have changed."""
-        changed_files = []
-        
-        for filepath, old_mtime in list(self.file_mtimes.items()):
-            try:
-                new_mtime = filepath.stat().st_mtime
-                if new_mtime != old_mtime:
-                    changed_files.append(filepath)
-                    self.file_mtimes[filepath] = new_mtime
-            except OSError:
-                changed_files.append(filepath)
-                del self.file_mtimes[filepath]
-        
-        for watch_dir in self.watch_dirs:
-            for ext in self.watch_extensions:
-                for filepath in Path(watch_dir).rglob(f'*{ext}'):
-                    if filepath not in self.file_mtimes:
-                        try:
-                            self.file_mtimes[filepath] = filepath.stat().st_mtime
-                            changed_files.append(filepath)
-                        except OSError:
-                            pass
-        
-        if changed_files:
-            print(f"\n[Reloader] Detected changes in:")
-            for f in changed_files:
-                print(f"  - {f.name}")
-            return True
-        return False
-    
-    def start_server(self, args):
-        """Start the server as a subprocess."""
-        cmd = [sys.executable] + sys.argv
-        cmd = [arg for arg in cmd if arg != '--reload']
-        
-        print(f"\n[Reloader] Starting server...")
-        self.process = subprocess.Popen(cmd)
-        return self.process
-    
-    def stop_server(self):
-        """Stop the server subprocess."""
-        if self.process:
-            print(f"\n[Reloader] Stopping server...")
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-            self.process = None
-    
-    def run(self, args):
-        """Main reload loop."""
-        print("\n" + "=" * 60)
-        print("  🔄 AUTO-RELOAD MODE ENABLED")
-        print("=" * 60)
-        print(f"\n  Monitoring: {', '.join(str(d) for d in self.watch_dirs)}")
-        print(f"  Extensions: {', '.join(self.watch_extensions)}")
-        print(f"  Files tracked: {len(self.file_mtimes)}")
-        print("\n  Press Ctrl+C to stop")
-        print("=" * 60)
-        
-        def signal_handler(signum, frame):
-            self.should_exit = True
-            self.stop_server()
-            sys.exit(0)
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        self.start_server(args)
-        
-        try:
-            while not self.should_exit:
-                time.sleep(1)
-                
-                if self.check_for_changes():
-                    self.stop_server()
-                    print("[Reloader] Restarting server...\n")
-                    time.sleep(0.5)
-                    self.start_server(args)
-        
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.stop_server()
-
-
-# ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Jarvis Voice Assistant Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
-    parser.add_argument("--llm", default="cerebras", choices=["gemini", "cerebras"],
-                        help="LLM provider (default: cerebras)")
-    parser.add_argument("--token", default=None, 
-                        help="Authentication token (default: from JARVIS_AUTH_TOKEN env or 'Denemeler123.')")
-    parser.add_argument("--no-fcm", action="store_true",
-                        help="Disable FCM functionality")
-    parser.add_argument("--location-interval", type=int, default=30,
-                        help="Location tracking interval in minutes (default: 30)")
-    parser.add_argument("--reload", action="store_true",
-                        help="Enable auto-reload on file changes")
-    
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("PORT", 8000)),
+                        help="Server port (default: PORT env var or 8000)")
+    parser.add_argument("--llm", default=os.environ.get("LLM_PROVIDER", "cerebras"),
+                        choices=["gemini", "cerebras"])
+    parser.add_argument("--no-fcm", action="store_true")
+    parser.add_argument("--location-interval", type=int, default=30)
+
     args = parser.parse_args()
-    
-    if args.reload:
-        reloader = ServerReloader(
-            watch_dirs=[Path.cwd()],
-            watch_extensions={'.py', '.json'}
-        )
-        reloader.run(args)
-        return
-    
+
     server = JarvisServer(
-        host=args.host, 
+        host=args.host,
         port=args.port,
         llm_provider=args.llm,
-        auth_token=args.token,
         enable_fcm=not args.no_fcm,
         location_interval=args.location_interval
     )
-    
+
     try:
         asyncio.run(server.start())
     except KeyboardInterrupt:
-        print("\n\n[Server] Shutting down...")
+        print("\n[Server] Shutting down...")
 
 
 if __name__ == "__main__":

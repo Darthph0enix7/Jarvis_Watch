@@ -519,7 +519,14 @@
     <script>
         // Configuration
         const API_BASE = window.location.origin;
-        const WS_URL = `ws://${window.location.host}/ws/locations`;
+        const TOKEN = new URLSearchParams(window.location.search).get('token') || '';
+        const WS_URL = `ws://${window.location.host}/ws/locations?token=${TOKEN}`;
+        
+        // Helper: add token to any URL
+        function apiUrl(path) {
+            const sep = path.includes('?') ? '&' : '?';
+            return `${API_BASE}${path}${sep}token=${TOKEN}`;
+        }
         
         // State
         let map;
@@ -844,8 +851,8 @@
             try {
                 const limit = document.getElementById('limitSelect').value;
                 const url = selectedDevice 
-                    ? `${API_BASE}/api/locations/${selectedDevice}?limit=${limit}`
-                    : `${API_BASE}/api/locations?limit=${limit}`;
+                    ? apiUrl(`/api/locations/${selectedDevice}?limit=${limit}`)
+                    : apiUrl(`/api/locations?limit=${limit}`);
                 
                 const response = await fetch(url);
                 const data = await response.json();
@@ -876,7 +883,7 @@
         // Request location update
         async function requestLocationUpdate() {
             try {
-                const response = await fetch(`${API_BASE}/api/request-location-all`, {
+                const response = await fetch(apiUrl('/api/request-location-all'), {
                     method: 'POST'
                 });
                 const data = await response.json();

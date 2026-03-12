@@ -1,6 +1,16 @@
-Jarvis_Watch/__pycache__
+__pycache__/
+**/__pycache__/
+*.pyc
 .DS_Store
-llm/__pycache__
-__pycache__
-jarvis-app-43084-firebase-adminsdk-fbsvc-c836619551.json
+
+# Runtime data
 device_locations.jsonl
+session_stats.jsonl
+
+# Plain Firebase credentials — never commit these
+# Commit the .enc version instead (see encrypt_creds.py)
+*.json
+!package.json
+
+# Encrypted credentials are safe to commit
+!*.enc

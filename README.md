@@ -1,25 +1,14 @@
-# Project Jarvis - Voice Assistant Pipeline
+# Jarvis Voice Assistant – Server
 
-A low-latency voice assistant with pluggable LLM providers and client-server architecture.
+Low-latency voice assistant server with WebSocket streaming,  
+pluggable LLM providers, Firebase FCM device management, and location tracking.
 
 ## Architecture
 
-### Standalone Mode (main.py)
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   STT       │ →  │    LLM      │ →  │    TTS      │
-│  (Cartesia) │    │ (Pluggable) │    │  (Cartesia) │
-└─────────────┘    └─────────────┘    └─────────────┘
-     ↑                                      ↓
-  Microphone                            Speaker
-```
-
-### Client-Server Mode (server.py + clients)
 ```
 ┌──────────────────┐         ┌──────────────────────────────────────┐
 │      CLIENT      │  WS     │              SERVER                  │
-│  (Watch/Phone)   │ ◄────►  │  STT → LLM → TTS                     │
-│                  │         │                                      │
+│  (Watch/Phone)   │ ◄────►  │  STT (Cartesia) → LLM → TTS          │
 │  🎤 Mic Input    │ ────►   │  Process voice, generate response    │
 │  🔊 Speaker Out  │ ◄────   │  Stream audio back                   │
 └──────────────────┘         └──────────────────────────────────────┘
@@ -28,6 +17,68 @@ A low-latency voice assistant with pluggable LLM providers and client-server arc
 ## Project Structure
 
 ```
+server.py            — Main HTTP/WebSocket server (entry point)
+voice_assistant.py   — STT → LLM → TTS pipeline, session handling
+protocol.py          — Shared message types and audio constants
+location_tracking.py — Device location storage
+fcm_service.py       — Firebase Cloud Messaging & device management
+dashboard.html       — Location tracking web dashboard
+llm/                 — Pluggable LLM clients (Gemini, Cerebras)
+requirements.txt     — Python dependencies
+```
+
+## Deploy to Koyeb
+
+**Build command**
+```
+pip install -r requirements.txt
+```
+
+**Start command**
+```
+python server.py
+```
+
+**Environment variables**
+
+| Variable | Required | Description |
+|---|---|---|
+| `JARVIS_AUTH_TOKEN` | yes | Token clients use to authenticate |
+| `CARTESIA_API_KEY` | yes | Cartesia STT/TTS API key |
+| `CEREBRAS_API_KEY` | yes | Cerebras LLM API key (if using Cerebras) |
+| `GEMINI_API_KEY` | no | Google Gemini API key (if using Gemini) |
+| `PORT` | no | Port to listen on (default: `8000`) |
+| `LLM_PROVIDER` | no | `cerebras` or `gemini` (default: `cerebras`) |
+| `FIREBASE_SERVICE_ACCOUNT` | no | Path to Firebase JSON credentials file |
+
+> The server listens on `0.0.0.0:$PORT` (default 8000).  
+> Koyeb health checks are answered by `GET /health` (no auth required).
+
+## API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Health check (no auth) |
+| `GET` | `/ws?token=<token>` | Voice assistant WebSocket |
+| `GET` | `/` or `/dashboard` | Location dashboard |
+| `POST` | `/api/register-device` | Register FCM device |
+| `GET` | `/api/devices` | List devices |
+| `POST` | `/api/request-location/{id}` | Push location request |
+| `POST` | `/api/location-update` | Receive location from device |
+| `POST` | `/api/transform` | Text correction via LLM |
+| `GET` | `/api/stats` | Device stats |
+
+## Voice Session Protocol
+
+1. Client connects to `ws://.../ws?token=<token>`
+2. Client sends `{"type":"session_start","client_type":"watch"}`
+3. Server responds `session_started` then `session_ready`
+4. Client streams `{"type":"audio","data":"<base64 PCM>"}` chunks  
+   — or raw binary frames  
+   — **pre-buffer audio** sent _before_ `session_ready` is queued automatically
+5. Server sends `transcript`, `response_text`, and binary audio chunks
+6. Server sends `done` when finished
+
 Jarvis_Watch/
 ├── main.py                 # Standalone mode (local mic + speaker)
 ├── server.py               # WebSocket server for remote clients

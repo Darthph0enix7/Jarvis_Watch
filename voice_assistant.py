@@ -553,7 +553,9 @@ class VoiceSession:
         self.cartesia_params = cartesia_params
         
         self.audio_queue: asyncio.Queue = asyncio.Queue()
-        self.is_active = False
+        # Accept audio immediately so pre-buffer frames sent before SESSION_READY
+        # are queued and forwarded to STT once the connection is established.
+        self.is_active = True
         self.full_transcript = ""
         self.full_response = ""
         
@@ -602,7 +604,6 @@ class VoiceSession:
     
     async def start(self, client_type: str = "unknown") -> None:
         """Initialize and start the session."""
-        self.is_active = True
         self.stats.timestamps['session_start'] = time.time()
         self.stats.client_type = client_type
         
@@ -676,7 +677,12 @@ class VoiceSession:
         await self.cleanup()
     
     async def process_audio_stream(self) -> None:
-        """Process incoming audio chunks."""
+        """Process incoming audio chunks, forwarding them to the STT client.
+
+        Any audio that arrived before STT was connected (pre-buffer) is already
+        sitting in ``audio_queue`` — it will be sent in order once the STT
+        WebSocket is confirmed ready.
+        """
         while self.is_active and not self.stt_done_event.is_set():
             try:
                 audio_chunk = await asyncio.wait_for(

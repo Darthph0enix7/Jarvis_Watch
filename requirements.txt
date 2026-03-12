@@ -1,5 +1,4 @@
 # Jarvis Voice Assistant - Python Dependencies
-# ================================================
 
 # Core WebSocket support
 websockets
@@ -10,8 +9,10 @@ aiohttp
 # Firebase Cloud Messaging
 firebase-admin
 
-# Audio processing (for main.py and demo_client.py)
-# PyAudio
+# Credential encryption (AES-128 via Fernet)
+cryptography
+
+# LLM Providers
 
 # LLM Providers
 google-genai
