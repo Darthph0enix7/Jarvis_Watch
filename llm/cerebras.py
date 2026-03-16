@@ -22,7 +22,7 @@ class CerebrasLLMClient(BaseLLMClient):
         
         # Cerebras-specific config
         self.temperature = 0.7
-        self.max_tokens = 512
+        self.max_tokens = 1024
         self.top_p = 0.95
     
     @property

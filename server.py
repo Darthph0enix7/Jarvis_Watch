@@ -42,8 +42,8 @@ FIREBASE_SERVICE_ACCOUNT = os.environ.get(
 )
 
 # LLM configuration
-GEMINI_MODEL = "models/gemini-2.5-flash-lite"
-CEREBRAS_MODEL = "gpt-oss-120b"
+GEMINI_MODEL = "models/gemini-3.1-flash-lite"
+CEREBRAS_MODEL = "qwen-3-235b-a22b-instruct-2507"
 
 # Transform endpoint rate limiting
 TRANSFORM_RATE_LIMIT = 30  # max requests per minute per IP
