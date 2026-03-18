@@ -14,3 +14,4 @@ session_stats.jsonl
 
 # Encrypted credentials are safe to commit
 !*.enc
+access_log.jsonl
