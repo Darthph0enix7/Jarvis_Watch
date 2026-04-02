@@ -1,0 +1,30 @@
+# ── Python artifacts ──────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ── Secrets — NEVER bake plain credentials into the image ────────────────────
+# Only the .enc (encrypted) version is included (see encrypt_creds.py).
+*.json
+
+# ── Runtime-generated data (written at runtime, not needed in image) ─────────
+device_locations.jsonl
+session_stats.jsonl
+access_log.jsonl
+server.log
+
+# ── Local dev files ───────────────────────────────────────────────────────────
+.env
+.env.*
+*.local
+
+# ── OS / editor noise ─────────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+
+# ── Version control ───────────────────────────────────────────────────────────
+.git/
+.gitignore

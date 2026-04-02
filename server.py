@@ -6,11 +6,11 @@ import os
 import time
 import base64
 import argparse
+import signal
 from typing import Optional
 from pathlib import Path
 
 from aiohttp import web
-import websockets
 
 # Import protocol definitions
 from protocol import MessageType, INPUT_SAMPLE_RATE, create_message
@@ -28,7 +28,7 @@ from fcm_service import DeviceManager, FCMNotificationService
 # ============================================================================
 
 # Authentication
-AUTH_TOKEN = os.environ.get("JARVIS_AUTH_TOKEN", "Denemeler123.")
+AUTH_TOKEN = os.environ.get("JARVIS_AUTH_TOKEN")
 
 # API Keys
 CARTESIA_API_KEY = os.environ.get("CARTESIA_API_KEY")
@@ -127,8 +127,6 @@ def create_llm_client(provider: str = "cerebras"):
 # TEXT TRANSFORMER (for /api/transform endpoint)
 # ============================================================================
 
-# Configurable system prompt for the transform endpoint
-# Configurable system prompt for the transform endpoint
 # Configurable system prompt for the transform endpoint
 TRANSFORM_SYSTEM_PROMPT = (
     "You are a strict text corrector assistant. "
@@ -932,11 +930,19 @@ class JarvisServer:
         if self.enable_fcm and self.periodic_tracker:
             await self.periodic_tracker.start()
         
+        # Graceful shutdown on SIGTERM (sent by Koyeb/Docker on stop)
+        # and SIGINT (Ctrl-C in local dev).
+        loop = asyncio.get_running_loop()
+        stop = loop.create_future()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set_result, None)
+
         try:
-            await asyncio.Future()
+            await stop
         finally:
             if self.periodic_tracker:
                 await self.periodic_tracker.stop()
+            await runner.cleanup()
 
 
 # ============================================================================

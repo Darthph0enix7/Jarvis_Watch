@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# koyeb.yaml — Koyeb service definition (used with the Koyeb CLI)
+#
+# Deploy:
+#   koyeb app create jarvis
+#   koyeb services create --app jarvis --config koyeb.yaml
+#
+# Or paste equivalent settings into the Koyeb web dashboard.
+# Docs: https://www.koyeb.com/docs
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: jarvis
+
+services:
+  - name: server
+    type: web
+
+    # ── Build ────────────────────────────────────────────────────────────────
+    # Koyeb builds your Docker image automatically from the repo root.
+    # The Dockerfile is detected automatically.
+    docker:
+      dockerfile: Dockerfile
+
+    # ── Instance ─────────────────────────────────────────────────────────────
+    instance_type: nano   # upgrade to small/medium for heavier LLM load
+
+    # ── Regions ──────────────────────────────────────────────────────────────
+    regions:
+      - was   # Washington D.C. — options: fra, sin, syd, tyo, bom, jed
+
+    # ── Networking ───────────────────────────────────────────────────────────
+    ports:
+      - port: 8000
+        protocol: http
+
+    # ── Health check ─────────────────────────────────────────────────────────
+    # /health returns {"status":"ok"} with no authentication required.
+    health_checks:
+      - http:
+          path: /health
+          port: 8000
+        initial_delay: 10
+        interval: 30
+        timeout: 5
+        restart_limit: 3
+
+    # ── Environment variables ─────────────────────────────────────────────────
+    # Store sensitive values as Koyeb secrets:
+    #   koyeb secrets create jarvis-auth-token  --value "your_token"
+    #   koyeb secrets create cartesia-api-key   --value "sk_car_..."
+    #   koyeb secrets create cerebras-api-key   --value "csk-..."
+    envs:
+      - key: PORT
+        value: "8000"
+
+      # ── Required secrets (create via CLI / dashboard before first deploy) ──
+      - key: JARVIS_AUTH_TOKEN
+        secret: jarvis-auth-token
+
+      - key: CARTESIA_API_KEY
+        secret: cartesia-api-key
+
+      - key: CEREBRAS_API_KEY
+        secret: cerebras-api-key
+
+      # ── Optional ──────────────────────────────────────────────────────────
+      # Uncomment and create the secret if you switch to Gemini:
+      # - key: GEMINI_API_KEY
+      #   secret: gemini-api-key
+
+      # Uncomment to override the default LLM provider:
+      # - key: LLM_PROVIDER
+      #   value: cerebras
+
+      # How often (minutes) to poll device locations (default: 30):
+      # - key: LOCATION_INTERVAL
+      #   value: "30"
