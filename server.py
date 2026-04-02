@@ -42,8 +42,8 @@ FIREBASE_SERVICE_ACCOUNT = os.environ.get(
 )
 
 # LLM configuration
-GEMINI_MODEL = "models/gemini-3.1-flash-lite"
-CEREBRAS_MODEL = "qwen-3-235b-a22b-instruct-2507"
+GEMINI_MODEL = "models/gemini-3.1-flash-lite-preview"
+CEREBRAS_MODEL = "gpt-oss-120b"
 
 # Transform endpoint rate limiting
 TRANSFORM_RATE_LIMIT = 30  # max requests per minute per IP
@@ -1013,7 +1013,7 @@ def main():
     parser.add_argument("--port", type=int,
                         default=int(os.environ.get("PORT", 8000)),
                         help="Server port (default: PORT env var or 8000)")
-    parser.add_argument("--llm", default=os.environ.get("LLM_PROVIDER", "cerebras"),
+    parser.add_argument("--llm", default=os.environ.get("LLM_PROVIDER", "gemini"),
                         choices=["gemini", "cerebras"])
     parser.add_argument("--no-fcm", action="store_true")
     parser.add_argument("--location-interval", type=int, default=30)

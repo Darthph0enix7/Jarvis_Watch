@@ -11,7 +11,7 @@ from .base import BaseLLMClient
 class GeminiLLMClient(BaseLLMClient):
     """Google Gemini LLM client with streaming support."""
     
-    def __init__(self, api_key: str, model: str = "models/gemini-2.5-flash-lite"):
+    def __init__(self, api_key: str, model: str = "gemini-3.1-flash-lite-preview"):
         super().__init__()
         self.client = genai.Client(api_key=api_key)
         self.model = model
@@ -22,7 +22,7 @@ class GeminiLLMClient(BaseLLMClient):
         
         # Gemini-specific config
         self.temperature = 0.7
-        self.max_output_tokens = 512
+        self.max_output_tokens = 40000
         self.top_p = 0.95
     
     @property
