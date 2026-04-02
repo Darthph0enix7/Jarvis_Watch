@@ -15,3 +15,5 @@ session_stats.jsonl
 # Encrypted credentials are safe to commit
 !*.enc
 access_log.jsonl
+server.log
+jarvis-app-43084-firebase-adminsdk-fbsvc-c836619551.json
