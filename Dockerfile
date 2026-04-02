@@ -8,6 +8,10 @@
 
 FROM python:3.11-slim
 
+# Ensure Python output is sent straight to logs, no buffering
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 # Build-time deps for packages with C extensions (cryptography, etc.)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc libffi-dev \

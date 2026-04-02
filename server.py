@@ -941,7 +941,8 @@ class JarvisServer:
         print(f"\n  Host: {self.host}")
         print(f"  Port: {self.port}")
         print(f"  LLM Provider: {self.llm_provider}")
-        print(f"  Auth Token: {self.auth_token[:4]}...{self.auth_token[-4:]}")
+        tok = self.auth_token or ""
+        print(f"  Auth Token: {tok[:4]}...{tok[-4:] if len(tok) > 4 else ''}")
         print(f"\n  WebSocket URL: ws://{self.host}:{self.port}/ws?token=<your_token>")
         print(f"  HTTP API URL: http://{self.host}:{self.port}/api")
         
@@ -987,6 +988,25 @@ class JarvisServer:
 # MAIN
 # ============================================================================
 
+def _validate_env() -> None:
+    """Fail fast with a clear message if required environment variables are missing."""
+    missing = []
+    if not os.environ.get("JARVIS_AUTH_TOKEN"):
+        missing.append("JARVIS_AUTH_TOKEN")
+    if not os.environ.get("CARTESIA_API_KEY"):
+        missing.append("CARTESIA_API_KEY")
+    provider = os.environ.get("LLM_PROVIDER", "cerebras")
+    if provider == "cerebras" and not os.environ.get("CEREBRAS_API_KEY"):
+        missing.append("CEREBRAS_API_KEY")
+    if provider == "gemini" and not os.environ.get("GEMINI_API_KEY"):
+        missing.append("GEMINI_API_KEY")
+    if missing:
+        raise SystemExit(
+            f"[Server] FATAL: Missing required environment variables: {', '.join(missing)}\n"
+            f"        Set them via Koyeb secrets or a .env file."
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Jarvis Voice Assistant Server")
     parser.add_argument("--host", default="0.0.0.0")
@@ -999,6 +1019,8 @@ def main():
     parser.add_argument("--location-interval", type=int, default=30)
 
     args = parser.parse_args()
+
+    _validate_env()
 
     server = JarvisServer(
         host=args.host,
