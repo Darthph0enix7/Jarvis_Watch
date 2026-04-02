@@ -223,6 +223,24 @@ class RateLimiter:
         return True
 
 
+def _extract_basic_auth(request: web.Request) -> tuple[Optional[str], Optional[str]]:
+    """Extract username:password from HTTP Authorization: Basic header.
+    
+    Returns: (username, password) or (None, None) if not provided.
+    """
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Basic '):
+        return None, None
+    
+    try:
+        encoded = auth_header[6:]
+        decoded = base64.b64decode(encoded).decode('utf-8')
+        username, password = decoded.split(':', 1)
+        return username, password
+    except Exception:
+        return None, None
+
+
 def _make_auth_middleware(auth_token: str):
     """Enforce token auth on every route and add security headers to all HTTP responses.
 
@@ -279,7 +297,8 @@ class HTTPAPIServer:
     def __init__(self, device_manager: DeviceManager, fcm_service: FCMNotificationService, 
                  llm_provider: str, auth_token: str, location_tracker: LocationTracker,
                  cartesia_api_key: str, cartesia_params: dict,
-                 text_transformer: 'TextTransformer'):
+                 text_transformer: 'TextTransformer',
+                 dashboard_user: Optional[str] = None, dashboard_password: Optional[str] = None):
         self.device_manager = device_manager
         self.fcm_service = fcm_service
         self.llm_provider = llm_provider
@@ -288,6 +307,8 @@ class HTTPAPIServer:
         self.cartesia_api_key = cartesia_api_key
         self.cartesia_params = cartesia_params
         self.text_transformer = text_transformer
+        self.dashboard_user = dashboard_user
+        self.dashboard_password = dashboard_password
         self.app = web.Application(middlewares=[_make_auth_middleware(self.auth_token)])
         self.active_sessions: dict[str, VoiceSession] = {}
         self._transform_limiter = RateLimiter(TRANSFORM_RATE_LIMIT)
@@ -339,7 +360,17 @@ class HTTPAPIServer:
         return web.json_response({'status': 'ok'})
 
     async def serve_dashboard(self, request: web.Request) -> web.Response:
-        """Serve the location tracking dashboard."""
+        """Serve the location tracking dashboard with optional HTTP Basic Auth."""
+        # Check HTTP Basic Auth if dashboard credentials are configured
+        if self.dashboard_user and self.dashboard_password:
+            username, password = _extract_basic_auth(request)
+            if not (username == self.dashboard_user and password == self.dashboard_password):
+                return web.Response(
+                    text='Unauthorized',
+                    status=401,
+                    headers={'WWW-Authenticate': 'Basic realm="Jarvis Dashboard"'}
+                )
+        
         html_path = Path(__file__).parent / 'dashboard.html'
         if html_path.exists():
             return web.FileResponse(html_path)
@@ -835,13 +866,16 @@ class JarvisServer:
     
     def __init__(self, host: str = "0.0.0.0", port: int = 8000,
                  llm_provider: str = "cerebras", auth_token: str = None,
-                 enable_fcm: bool = True, location_interval: int = 30):
+                 enable_fcm: bool = True, location_interval: int = 30,
+                 dashboard_user: Optional[str] = None, dashboard_password: Optional[str] = None):
         self.host = host
         self.port = port
         self.llm_provider = llm_provider
         self.auth_token = auth_token or AUTH_TOKEN
         self.enable_fcm = enable_fcm
         self.location_interval = location_interval
+        self.dashboard_user = dashboard_user or os.environ.get("DASHBOARD_USER")
+        self.dashboard_password = dashboard_password or os.environ.get("DASHBOARD_PASSWORD")
         
         # FCM components
         self.device_manager: Optional[DeviceManager] = None
@@ -874,7 +908,9 @@ class JarvisServer:
                     self.location_tracker,
                     CARTESIA_API_KEY,
                     CARTESIA_PARAMS,
-                    self.text_transformer
+                    self.text_transformer,
+                    self.dashboard_user,
+                    self.dashboard_password
                 )
                 print("[Server] FCM services initialized")
             except Exception as e:
@@ -892,7 +928,9 @@ class JarvisServer:
                 self.location_tracker,
                 CARTESIA_API_KEY,
                 CARTESIA_PARAMS,
-                self.text_transformer
+                self.text_transformer,
+                self.dashboard_user,
+                self.dashboard_password
             )
     
     async def start(self) -> None:
